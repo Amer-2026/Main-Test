@@ -1,151 +1,3090 @@
-import streamlit as st
-import pandas as pd
-import math
+"""
+Agricultural Groundwater Analysis Dashboard
+============================================
+A single, configurable Streamlit app serving all country deployments
+(Jordan, Iraq, Palestine, ...). Country settings live in config/*.json —
+to add a new country you only add a config file and the GEE assets.
+
+Data: monthly abstraction (mm, m3) and rech arge images stored as
+Google Earth Engine assets named  <parameter>_<YYYY>_<MM>.
+
+Authentication: a GEE service-account key stored in Streamlit secrets
+under [gee_credentials]  (see docs/03_deploy_streamlit_EN.md).
+"""
+
+import json
+import traceback
+from datetime import datetime
 from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+import ee
+import folium
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
+from folium.plugins import Fullscreen, MousePosition, Draw
+from streamlit_folium import st_folium
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+import base64
+
+def get_base64_image(image_path):
+    try:
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    except FileNotFoundError:
+        return ""
+
+# ==================== Translations ====================
+TRANSLATIONS = {
+    "en": {
+        "page_title": "Groundwater Analysis",
+        "dashboard_header": "Groundwater Analysis Dashboard — Erbil Region",
+        "country": "Country / Area",
+        "ee_init_failed": "Failed to initialize Earth Engine. Please check your credentials.",
+        "ee_init_critical": "Critical Error Initializing Earth Engine",
+        "ee_init_default": "Earth Engine initialized with default credentials",
+        "ee_verify_failed": "Earth Engine verification failed",
+        "ee_init_error": "Earth Engine initialization failed",
+        "control_panel": "Control Panel",
+        "location_settings": "📍 Location Settings",
+        "latitude": "Latitude",
+        "longitude": "Longitude",
+        "zoom_level": "Zoom Level",
+        "data_selection": "Data Selection",
+        "parameter": "Parameter",
+        "parameter_help": "Choose the parameter to visualize",
+        "no_assets": "No assets found in the specified path. Please verify the path and permissions.",
+        "no_dates": "No valid dates found in assets",
+        "month": "Month",
+        "visual_settings": "🎨 Visual Settings",
+        "layer_opacity": "Layer Opacity",
+        "generate_map": "Generate Map",
+        "error_asset": "Error in asset handling",
+        "interactive_map": "Interactive Map",
+        "no_data_month": "No data available for selected month and parameter",
+        "statistics": "Statistics",
+        "time_series_analysis": "Time Series Analysis",
+        "click_map": "📌 Click on the map to view time series data for that location",
+        "error_map": "Error generating map",
+        "welcome_title": "Welcome to the Groundwater Analysis Dashboard",
+        "welcome_text": "Select parameters and click 'Generate Map' to begin your analysis",
+        "about_tool": "ℹ️ About This Tool",
+        "about_text": """This dashboard provides comprehensive groundwater analysis capabilities:
+
+- 🌍 **Interactive Visualization**: View monthly groundwater data on an interactive map
+- 📊 **Statistical Analysis**: Access key statistics for the selected parameter
+- 📈 **Time Series Analysis**: Click any location to view historical trends
+- 📥 **Data Export**: Download time series and al summaries as CSV
+- 🎨 **Customizable Display**: Adjust visualization parameters to your needs
+
+Data sources: FAO WaPOR v3 (actual evapotranspiration), CHIRPS (rainfall),
+OpenLandMap (soil properties), processed in Google Earth Engine.
+
+For support or more information, please contact the development team.""",
+        "layer_statistics": "Layer Statistics",
+        "minimum": "Minimum",
+        "maximum": "Maximum",
+        "mean": "Mean",
+        "error_statistics": "Error calculating statistics",
+        "no_data_location": "No data available for this location",
+        "date": "Date",
+        "time_series_title": "Time Series for {parameter} at ({lat}, {lon})",
+        "legend": "{parameter} Legend",
+        "layer": "Layer",
+        "abstraction_mm": "Abstraction (mm)",
+        "abstraction_m3": "Abstraction (m³)",
+        "": "",
+        "error_get_assets": "Error in get_ee_assets",
+        "error_parse_date": "Error parsing date from asset",
+        "value_label": "Value",
+        "download_csv": "📥 Download as CSV",
+        "al_summary": "al Monthly Summary",
+        "compute_summary": "Compute al summary",
+        "summary_help": "Average value over the whole study area for every month (may take up to a minute)",
+        "summary_title": "al mean {parameter} per month",
+        "computing": "Computing... this may take a minute",
+        "raw_data": "View raw data",
+        "nav_abstraction_mm": "Abstraction (mm)",
+        "nav_abstraction_m3": "Abstraction (m³)",
+        "nav_recharge_mm": "Recharge (mm)",
+        "nav_recharge_m3": "Recharge (m³)",
+        "nav__mm": " (mm)",
+        "nav__m3": " (m³)",
+        "nav_": "",
+        "nav_region": "REGION",
+        "nav_subnational": "Sub-National",
+        "nav_national": "National",
+        "nav_analysis": "Analysis",
+        "nav_wsi": "Water Stress Index",
+        "nav_water_balance": "Water Balance",
+        "nav_climate_et": "Climate / ET",
+        "nav_irrigation": "Irrigation Efficiency",
+        "nav_aeti": "Actual Evapotranspiration (AETI)",
+        "nav_pet": "Potential Evapotranspiration (PET)",
+        "nav_precip": "Precipitation",
+        "nav_pwl": "Potential Water Loss (PWL)",
+        "nav_download": "Download",
+        "data_status": "Data Status",
+        "active_months": "Active Months",
+        "last_update": "Last Update",
+        "select_date": "Select Date",
+        "select_date_range": "Select Date Range",
+        "generate_analysis": "Generate Analysis",
+        "welcome_subtitle": "✨ Welcome! Select parameters and click 'Generate Map' to begin your analysis.",
+        "click_to_view": "Click on the map to view time series data",
+    },
+    "ar": {
+        "page_title": "تحليل المياه الجوفية",
+        "dashboard_header": "لوحة تحليل المياه الجوفية — منطقة أربيل",
+        "country": "الدولة / المنطقة",
+        "ee_init_failed": "فشل تهيئة محرك الأرض. يرجى التحقق من بيانات الاعتماد.",
+        "ee_init_critical": "خطأ حرج في تهيئة محرك الأرض",
+        "ee_init_default": "تم تهيئة محرك الأرض ببيانات الاعتماد الافتراضية",
+        "ee_verify_failed": "فشل التحقق من محرك الأرض",
+        "ee_init_error": "فشل تهيئة محرك الأرض",
+        "control_panel": "لوحة التحكم",
+        "location_settings": "📍 إعدادات الموقع",
+        "latitude": "خط العرض",
+        "longitude": "خط الطول",
+        "zoom_level": "مستوى التكبير",
+        "data_selection": "اختيار البيانات",
+        "parameter": "المعامل",
+        "parameter_help": "اختر المعامل للتصور",
+        "no_assets": "لم يتم العثور على أصول في المسار المحدد. يرجى التحقق من المسار والأذونات.",
+        "no_dates": "لم يتم العثور على تواريخ صالحة في الأصول",
+        "month": "الشهر",
+        "visual_settings": "🎨 إعدادات العرض",
+        "layer_opacity": "شفافية الطبقة",
+        "generate_map": "إنشاء الخريطة",
+        "error_asset": "خطأ في معالجة الأصول",
+        "interactive_map": "الخريطة التفاعلية",
+        "no_data_month": "لا توجد بيانات للشهر والمعامل المحددين",
+        "statistics": "الإحصاءات",
+        "time_series_analysis": "تحليل السلاسل الزمنية",
+        "click_map": "📌 انقر على الخريطة لعرض بيانات السلاسل الزمنية لذلك الموقع",
+        "error_map": "خطأ في إنشاء الخريطة",
+        "welcome_title": "مرحباً بكم في لوحة تحليل المياه الجوفية",
+        "welcome_text": "اختر المعاملات وانقر على 'إنشاء الخريطة' لبدء التحليل",
+        "about_tool": "ℹ️ حول هذه الأداة",
+        "about_text": """توفر هذه اللوحة إمكانيات شاملة لتحليل المياه الجوفية:
+
+- 🌍 **التصور التفاعلي**: عرض بيانات المياه الجوفية الشهرية على خريطة تفاعلية
+- 📊 **التحليل الإحصائي**: الوصول إلى الإحصاءات الرئيسية للمعامل المحدد
+- 📈 **تحليل السلاسل الزمنية**: انقر على أي موقع لعرض الاتجاهات التاريخية
+- 📥 **تصدير البيانات**: تنزيل السلاسل الزمنية والملخصات الإقليمية بصيغة CSV
+- 🎨 **عرض قابل للتخصيص**: ضبط معاملات التصور حسب احتياجاتك
+
+مصادر البيانات: FAO WaPOR v3 (التبخر-نتح الفعلي)، CHIRPS (الأمطار)،
+OpenLandMap (خصائص التربة)، تمت المعالجة في Google Earth Engine.
+
+للدعم أو مزيد من المعلومات، يرجى الاتصال بفريق التطوير.""",
+        "layer_statistics": "إحصاءات الطبقة",
+        "minimum": "الحد الأدنى",
+        "maximum": "الحد الأقصى",
+        "mean": "المتوسط",
+        "error_statistics": "خطأ في حساب الإحصاءات",
+        "no_data_location": "لا توجد بيانات لهذا الموقع",
+        "date": "التاريخ",
+        "time_series_title": "السلسلة الزمنية لـ {parameter} عند ({lat}, {lon})",
+        "legend": "مفتاح {parameter}",
+        "layer": "طبقة",
+        "abstraction_mm": "السحب (مم)",
+        "abstraction_m3": "السحب (م³)",
+        "": "التغذية الجوفية",
+        "error_get_assets": "خطأ في جلب الأصول",
+        "error_parse_date": "خطأ في تحليل التاريخ من الأصل",
+        "value_label": "القيمة",
+        "download_csv": "📥 تنزيل بصيغة CSV",
+        "al_summary": "الملخص الشهري الإقليمي",
+        "compute_summary": "حساب الملخص الإقليمي",
+        "summary_help": "متوسط القيمة على كامل منطقة الدراسة لكل شهر (قد يستغرق دقيقة)",
+        "summary_title": "المتوسط الإقليمي لـ {parameter} شهرياً",
+        "computing": "جارٍ الحساب... قد يستغرق دقيقة",
+        "raw_data": "عرض البيانات الخام",
+        "nav_abstraction_mm": "السحب (مم)",
+        "nav_abstraction_m3": "السحب (م³)",
+        "nav_recharge_mm": "التغذية الجوفية (مم)",
+        "nav_recharge_m3": "التغذية الجوفية (م³)",
+        "nav__mm": "التغذية الجوفية (مم)",
+        "nav__m3": "التغذية الجوفية (م³)",
+        "nav_": "المنطقة",
+        "nav_region": "المنطقة",
+        "nav_subnational": "دون الوطني",
+        "nav_national": "وطني",
+        "nav_analysis": "التحليل",
+        "nav_wsi": "مؤشر الإجهاد المائي",
+        "nav_water_balance": "التوازن المائي",
+        "nav_climate_et": "المناخ / التبخر-النتح",
+        "nav_irrigation": "كفاءة الري",
+        "nav_aeti": "التبخر-النتح الفعلي (AETI)",
+        "nav_pet": "التبخر-النتح المحتمل (PET)",
+        "nav_precip": "هطول الأمطار",
+        "nav_pwl": "فقدان المياه المحتمل (PWL)",
+        "data_status": "حالة البيانات",
+        "active_months": "الأشهر النشطة",
+        "last_update": "آخر تحديث",
+        "select_date": "اختر التاريخ",
+        "select_date_range": "اختر نطاق التاريخ",
+        "generate_analysis": "إنشاء التحليل",
+        "welcome_subtitle": "✨ مرحباً! اختر المعاملات وانقر على 'إنشاء الخريطة' لبدء التحليل.",
+        "click_to_view": "انقر على الخريطة لعرض بيانات السلاسل الزمنية",
+    },
+    "ku": {
+        "page_title": "شیکردنەوەی ئاوی ژێرزەوی",
+        "dashboard_header": "شیکردنەوەی ئاوی ژێرزەوی — هەرێمی هەولێر",
+        "country": "وڵات / ناوچە",
+        "ee_init_failed": "دەستپێکردنی ئێرث ئینجین شکستی هێنا. تکایە ڕەقمەکانی خۆت بپشکنە.",
+        "ee_init_critical": "هەڵەی گەورە لە دەستپێکردنی ئێرث ئینجین",
+        "ee_init_default": "ئێرث ئینجین بە ڕەقمی بنەڕەتی دەستپێکرا",
+        "ee_verify_failed": "پشکنینی ئێرث ئینجین شکستی هێنا",
+        "ee_init_error": "دەستپێکردنی ئێرث ئینجین شکستی هێنا",
+        "control_panel": "پانێلی کۆنتڕۆڵ",
+        "location_settings": "📍 ڕێکخستنەکانی شوێن",
+        "latitude": "پانی",
+        "longitude": "درێژی",
+        "zoom_level": "ئاستی زووم",
+        "data_selection": "هەڵبژاردنی داتا",
+        "parameter": "پارامەتر",
+        "parameter_help": "پارامەتری خواست بۆ بینین هەڵبژێرە",
+        "no_assets": "هیچ ئەستێک نەدۆزرایەوە لە ڕێڕەوی دیاریکراو. تکایە ڕێڕەوەکە و مۆڵەتەکان بپشکنە.",
+        "no_dates": "هیچ بەروارێکی دروست نەدۆزرایەوە لە ئەستەکاندا",
+        "month": "مانگ",
+        "visual_settings": "🎨 ڕێکخستنەکانی بینین",
+        "layer_opacity": "ڕوونی چین",
+        "generate_map": "دروستکردنی نەخشە",
+        "error_asset": "هەڵە لە بەرکارهێنانی ئەست",
+        "interactive_map": "نەخشەی کارلێک",
+        "no_data_month": "هیچ داتایەک بۆ مانگ و پارامەتری دیاریکراو بوونی نییە",
+        "statistics": "ئامارەکان",
+        "time_series_analysis": "شیکردنەوەی زنجیرەکاتی",
+        "click_map": "📌 کلیک لەسەر نەخشەکە بکە بۆ بینینی داتای زنجیرەکاتی بۆ ئەو شوێنە",
+        "error_map": "هەڵە لە دروستکردنی نەخشە",
+        "welcome_title": "بەخێربێیت بۆ پانێلی شیکردنەوەی ئاوی ژێرزەوی",
+        "welcome_text": "پارامەترەکان هەڵبژێرە و کلیک لە 'دروستکردنی نەخشە' بکە بۆ دەستپێکردنی شیکردنەوەکەت",
+        "about_tool": "ℹ️ دەربارەی ئەم ئامرازە",
+        "about_text": """ئەم پانێلە توانای شیکردنەوەی گشتگیری ئاوی ژێرزەوی دابین دەکات:
+
+- 🌍 **بینینی کارلێک**: داتای ئاوی ژێرزەوی مانگانە لەسەر نەخشەی کارلێک ببینە
+- 📊 **شیکردنەوەی ئاماری**: دەستگەیشتن بە ئامارە سەرەکییەکان بۆ پارامەتری دیاریکراو
+- 📈 **شیکردنەوەی زنجیرەکاتی**: کلیک لەسەر هەر شوێنێک بکە بۆ بینینی ڕەوتە مێژووییەکان
+- 📥 **هەناردنی داتا**: دابەزاندنی زنجیرەکات و پوختەی ناوچەیی وەک CSV
+- 🎨 **پیشاندانی گونجاو**: ڕێکخستنی پارامەترەکانی بینین بەپێی پێویستییەکانی تۆ
+
+سەرچاوەکانی داتا: FAO WaPOR v3، CHIRPS، OpenLandMap، لە Google Earth Engine دا پرسەکراوە.
+
+بۆ پشتیوانی یان زانیاری زیاتر، تکایە پەیوەندی بە تیمی پەرەپێدانەوە بکە.""",
+        "layer_statistics": "ئاماری چین",
+        "minimum": "کەمترین",
+        "maximum": "زۆرترین",
+        "mean": "تێکڕا",
+        "error_statistics": "هەڵە لە ژماردنی ئامارەکان",
+        "no_data_location": "هیچ داتایەک بۆ ئەم شوێنە بوونی نییە",
+        "date": "بەروار",
+        "time_series_title": "زنجیرەکات بۆ {parameter} لە ({lat}, {lon})",
+        "legend": "ڕێنوێنی {parameter}",
+        "layer": "چین",
+        "abstraction_mm": "دەرهێنان (مم)",
+        "abstraction_m3": "دەرهێنان (م³)",
+        "": "پڕبوونەوە",
+        "error_get_assets": "هەڵە لە هێنانی ئەستەکان",
+        "error_parse_date": "هەڵە لە شیکردنەوەی بەروار لە ئەست",
+        "value_label": "نرخ",
+        "download_csv": "📥 دابەزاندن وەک CSV",
+        "al_summary": "پوختەی مانگانەی ناوچەیی",
+        "compute_summary": "ژماردنی پوختەی ناوچەیی",
+        "summary_help": "تێکڕای نرخ بۆ هەموو ناوچەی لێکۆڵینەوە بۆ هەر مانگێک (لەوانەیە خولەکێک بخایەنێت)",
+        "summary_title": "تێکڕای ناوچەیی {parameter} بۆ هەر مانگێک",
+        "computing": "تێژینەوە... لەوانەیە خولەکێک بخایەنێت",
+        "raw_data": "داتای خاو",
+        "nav_abstraction_mm": "دەرهێنان (مم)",
+        "nav_abstraction_m3": "دەرهێنان (م³)",
+        "nav_recharge_mm": "پڕبوونەوە (مم)",
+        "nav_recharge_m3": "پڕبوونەوە (م³)",
+        "nav__mm": "پڕبوونەوە (مم)",
+        "nav__m3": "پڕبوونەوە (م³)",
+        "nav_": "ناوچە",
+        "nav_region": "ناوچە",
+        "nav_subnational": "ناوچەیی",
+        "nav_national": "نیشتمانی",
+        "nav_analysis": "شیکردنەوە",
+        "nav_wsi": "پێوەرەی کێشەی ئاو",
+        "nav_water_balance": "هاوسەنگی ئاو",
+        "nav_climate_et": "کەشوهەوا / هەڵمبوون",
+        "nav_irrigation": "کاریگەری ئاودێری",
+        "nav_aeti": "هەڵمبوونی ڕاستەقینە (AETI)",
+        "nav_pet": "هەڵمبوونی پێشبینیکراو (PET)",
+        "nav_precip": "بارانبارین",
+        "nav_pwl": "لەدەستدانی ئاوی پێشبینیکراو (PWL)",
+        "data_status": "دۆخی داتا",
+        "active_months": "مانگە چالاکەکان",
+        "last_update": "دوایین نوێکردنەوە",
+        "select_date": "بەروار هەڵبژێرە",
+        "select_date_range": "بەرواری دەستپێک و کۆتایی هەڵبژێرە",
+        "generate_analysis": "دروستکردنی شیکردنەوە",
+        "welcome_subtitle": "✨ بەخێربێیت! پارامەترەکان هەڵبژێرە و کلیک لە 'دروستکردنی نەخشە' بکە بۆ دەستپێکردنی شیکردنەوەکەت.",
+        "click_to_view": "کلیک لەسەر نەخشەکە بکە بۆ بینینی داتای زنجیرەکاتی",
+    },
+}
+
+
+def t(key, **kwargs):
+    """Get translated string for the current language"""
+    lang = st.session_state.get("lang", "en")
+    text = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key, key)
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
+
+
+# ==================== Country configuration ====================
+APP_DIR = Path(__file__).parent
+CONFIG_DIR = APP_DIR / "config"
+
 
 @st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+def load_country_configs():
+    """Load all country config files.
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
+    Looks first in a `config/` folder, then falls back to any *.json file
+    sitting next to the app (a common setup mistake). Only files that look
+    like a country config — i.e. contain a "key" and an "asset_path" — are
+    accepted, so package files like requirements never get mistaken for one.
     """
+    configs = {}
+    search_dirs = [CONFIG_DIR, APP_DIR] if CONFIG_DIR.is_dir() else [APP_DIR]
+    for folder in search_dirs:
+        for f in sorted(folder.glob("*.json")):
+            try:
+                cfg = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if isinstance(cfg, dict) and "key" in cfg and "asset_path" in cfg:
+                configs.setdefault(cfg["key"], cfg)
+        if configs:  # stop at the first folder that yielded configs
+            break
+    return configs
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def country_label(cfg):
+    name = cfg["name_ar"] if st.session_state.get("lang") == "ar" else cfg["name_en"]
+    return f"{cfg.get('flag', '')} {name}".strip()
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+
+# ==================== Earth Engine ====================
+def initialize_ee():
+    try:
+        if hasattr(st.secrets, "gee_credentials"):
+            credentials_dict = dict(st.secrets["gee_credentials"])
+            credentials = ee.ServiceAccountCredentials(
+                credentials_dict["client_email"],
+                key_data=json.dumps(credentials_dict),
+            )
+            # Pass the Cloud project explicitly. Without it the newer
+            # earthengine-api installed on Streamlit Cloud falls back to the
+            # "earthengine-legacy" project and mangles cloud asset paths
+            # (e.g. projects/earthengine-legacy/assets/projects/<id>/...).
+            project_id = credentials_dict.get("project_id")
+            ee.Initialize(credentials, project=project_id)
+        else:
+            ee.Initialize()
+        ee.Number(1).getInfo()  # verify the connection actually works
+        return True
+    except Exception as e:
+        st.error(f"{t('ee_init_error')}: {e}")
+        st.error(traceback.format_exc())
+        return False
+
+
+@st.cache_resource(ttl=3600)
+def get_ee_assets(asset_path):
+    """List image asset ids inside an Earth Engine folder"""
+    try:
+        assets = ee.data.listAssets({"parent": asset_path})
+        return [asset["id"] for asset in assets["assets"]]
+    except Exception as e:
+        st.error(f"{t('error_get_assets')}: {str(e)}")
+        return []
+
+
+def parse_asset_date(asset_id):
+    """Parse date from asset ID (format: <parameter>_<YYYY>_<MM>)"""
+    try:
+        parts = asset_id.split("_")
+        year, month = parts[-2], parts[-1]
+        return datetime.strptime(f"{year}-{month}-01", "%Y-%m-%d")
+    except Exception:
+        st.warning(f"{t('error_parse_date')}: {asset_id}")
+        return None
+
+
+# ==================== Map helpers ====================
+def create_base_map(center_lat, center_lon, zoom):
+    """Base map with 4 options: Satellite (default), Streets, Terrain, Humanitarian."""
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
+                   control_scale=True, tiles=None)
+
+    # 1) Satellite — DEFAULT (first added shows on load)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="🛰️ Satellite",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # 2) Streets (OpenStreetMap)
+    folium.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="OpenStreetMap",
+        name="🗺️ Streets",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # 3) Terrain / topographic
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="⛰️ Terrain",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    # 4) Humanitarian (borders + labels — good for reports)
+    folium.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
+        attr="Humanitarian OSM",
+        name="🌐 Humanitarian",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+
+    Fullscreen(position="topleft", force_separate_button=True).add_to(m)
+    # Drawing tools: Marker, Circle, Rectangle, Polygon, Polyline + Hand pan
+    Draw(
+        export=False,
+        position="topleft",
+        draw_options={
+            "polyline": {
+                "shapeOptions": {
+                    "color": "#e81cff",
+                    "weight": 3,
+                }
+            },
+            "polygon": {
+                "shapeOptions": {
+                    "color": "#e81cff",
+                    "fillColor": "#e81cff",
+                    "fillOpacity": 0.2,
+                    "weight": 3,
+                }
+            },
+            "rectangle": {
+                "shapeOptions": {
+                    "color": "#e81cff",
+                    "fillColor": "#e81cff",
+                    "fillOpacity": 0.2,
+                    "weight": 3,
+                }
+            },
+            "circle": {
+                "shapeOptions": {
+                    "color": "#e81cff",
+                    "fillColor": "#e81cff",
+                    "fillOpacity": 0.2,
+                    "weight": 3,
+                }
+            },
+            "marker": {},
+        },
+        edit_options={
+            "edit": True,
+            "remove": True,
+        },
+    ).add_to(m)
+
+    formatter = "function(num) {return L.Util.formatNum(num, 4) + '°';};"
+    MousePosition(
+        position="bottomleft",
+        separator=" | ",
+        prefix="Lat/Lon:",
+        num_digits=4,
+        lat_formatter=formatter,
+        lng_formatter=formatter,
+    ).add_to(m)
+
+    # ===== Inject border CSS INSIDE the map (bypasses iframe restriction) =====
+    border_css = """
+    <style>
+    .folium-map {
+        border: 4px solid #e81cff !important;
+        border-radius: 12px !important;
+        box-shadow: 0 0 24px rgba(232, 28, 255, 0.35) !important;
+    }
+
+    /* ===== Draw toolbar — clean light buttons (native look) ===== */
+    .leaflet-draw-toolbar a {
+        border-radius: 6px !important;
+        margin-bottom: 3px !important;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3) !important;
+    }
+    .leaflet-draw-toolbar a:hover {
+        box-shadow: 0 0 10px rgba(232, 28, 255, 0.7) !important;
+    }
+    .leaflet-draw-toolbar a.leaflet-draw-toolbar-button-enabled {
+        box-shadow: 0 0 12px rgba(232, 28, 255, 0.9) !important;
+        outline: 2px solid #e81cff !important;
+    }
+
+    /* ===== Colored icons — override Folium's default sprites ===== */
+
+    /* Marker tool — RED */
+    a.leaflet-draw-draw-marker {
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23f1515e'><path d='M12 2C8.1 2 5 5.1 5 9c0 5.3 7 13 7 13s7-7.7 7-13c0-3.9-3.1-7-7-7zm0 9.5a2.5 2.5 0 110-5 2.5 2.5 0 010 5z'/></svg>") !important;
+        background-size: 22px 22px !important;
+        background-position: center !important;
+        background-repeat: no-repeat !important;
+        background-color: #ffffff !important;
+    }
+
+    /* Circle tool — PINK */
+    a.leaflet-draw-draw-circle {
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23FF6B9D' stroke-width='2.5'><circle cx='12' cy='12' r='8'/></svg>") !important;
+        background-size: 22px 22px !important;
+        background-position: center !important;
+        background-repeat: no-repeat !important;
+        background-color: #ffffff !important;
+    }
+
+    /* Rectangle tool — DARK GREY */
+    a.leaflet-draw-draw-rectangle {
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%232b2b2b'><rect x='4' y='6' width='16' height='12'/></svg>") !important;
+        background-size: 22px 22px !important;
+        background-position: center !important;
+        background-repeat: no-repeat !important;
+        background-color: #ffffff !important;
+    }
+
+    /* Polygon tool — BLUE */
+    a.leaflet-draw-draw-polygon {
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%234263EB'><polygon points='12,3 21,9 17,20 7,20 3,9'/></svg>") !important;
+        background-size: 22px 22px !important;
+        background-position: center !important;
+        background-repeat: no-repeat !important;
+        background-color: #ffffff !important;
+    }
+
+    /* Map cursor — hand (grab) style */
+    .leaflet-container {
+        cursor: grab !important;
+    }
+    .leaflet-container.leaflet-dragging {
+        cursor: grabbing !important;
+    }
+    .leaflet-container.leaflet-grab {
+        cursor: grab !important;
+    }
+    .leaflet-container.leaflet-grabbing {
+        cursor: grabbing !important;
+     /* Delete / Edit tool — use default arrow cursor over shapes */
+    .leaflet-container.leaflet-crosshair,
+    .leaflet-container.leaflet-crosshair .leaflet-interactive,
+    .leaflet-touch .leaflet-bar a,
+    .leaflet-draw-edit-remove + .leaflet-draw-toolbar a,
+    .leaflet-container.leaflet-draw-edit-remove-active,
+    .leaflet-container.leaflet-draw-edit-edit-active,
+    .leaflet-container.leaflet-draw-edit-remove-active .leaflet-interactive,
+    .leaflet-container.leaflet-draw-edit-edit-active .leaflet-interactive {
+        cursor: default !important;
+    }
+    
+    """
+    m.get_root().html.add_child(folium.Element(border_css))
+
+
+    return m
+def add_ee_layer(map_obj, ee_image, vis_params, name):
+    """Add an Earth Engine image as a tile layer on a folium map"""
+    map_id_dict = ee_image.getMapId(vis_params)
+    folium.TileLayer(
+        tiles=map_id_dict["tile_fetcher"].url_format,
+        attr="Google Earth Engine",
+        name=name,
+        overlay=True,
+        control=True,
+        opacity=vis_params.get("opacity", 1.0),
+    ).add_to(map_obj)
+    return map_obj
+
+
+PALETTES = {
+    "abstraction_mm": ["#2b83ba", "#abdda4", "#ffffbf", "#fdae61", "#d7191c"],
+    "abstraction_m3": ["#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8",
+                        "#ffffbf", "#fee090", "#fdae61", "#f46d43", "#d73027"],
+    "recharge_mm": ["#a50026", "#d73027", "#f46d43", "#fdae61", "#fee08b",
+                  "#ffffbf", "#d9ef8b", "#a6d96a", "#66bd63", "#1a9850"],
+    "aeti": ["#ffffcc", "#c2e699", "#78c679", "#31a354", "#006837"],
+    "pet": ["#fff7bc", "#fee391", "#fec44f", "#fe9929", "#d95f0e"],
+    "precip": ["#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"],
+    "pwl": ["#f7f4f9", "#d4b9da", "#c994c7", "#df65b0", "#ce1256"],
+}
+
+UNITS = {
+    "abstraction_mm": "mm/month",
+    "abstraction_m3": "m³/month",
+    "recharge_mm": "mm/month",
+    "aeti": "mm/month",
+    "pet": "mm/month",
+    "precip": "mm/month",
+    "pwl": "mm/month",
+}
+
+
+@st.cache_data(ttl=3600)
+def get_image_min_max(asset_id):
+    """Min/max of an image asset (cached — one server call per asset)"""
+    img = ee.Image(asset_id)
+    
+    # IGNORE ZEROS: Update mask to remove 0s so they don't ruin the min/max calculation
+    valid_img = img.updateMask(img.neq(0))
+    
+    minmax = valid_img.reduce(
+        reducer=ee.Reducer.minMax(),
+        geometry=img.geometry(),
+        scale=1000,
+        maxPixels=1e9,
+        bestEffort=True
+    ).getInfo()
+    
+    min_key = next((key for key in minmax if key.endswith("_min")), None)
+    max_key = next((key for key in minmax if key.endswith("_max")), None)
+    
+    min_val = minmax.get(min_key) if min_key else None
+    max_val = minmax.get(max_key) if max_key else None
+    
+    # Fallback to a default range if everything is masked or min==max
+    if min_val is None or max_val is None or min_val == max_val:
+        return 0, 100  #  usually falls between 0 and 100 mm
+        
+    return min_val, max_val
+
+
+def _time_series_for_geometry(ee_geom, parameter, assets, scale=100):
+    """Monthly mean of `parameter` over an arbitrary Earth Engine geometry.
+
+    Uses `mean` reducer so it works for Point, LineString, Polygon, etc.
+    Larger `scale` (100 m) keeps it fast for areas/lines.
+    """
+    images = _collection_with_dates(assets, parameter)
+
+    def compute_mean(img):
+        return ee.Feature(
+            None,
+            {
+                "date": img.get("system:time_start"),
+                "value": img.reduce(
+                    reducer=ee.Reducer.mean(),
+                    geometry=ee_geom,
+                    scale=scale,
+                    maxPixels=1e9,
+                ).values().get(0),
+            },
+        )
+
+    results = images.map(compute_mean).getInfo()
+
+    processed = []
+    for feature in results["features"]:
+        props = feature["properties"]
+        if props["value"] is not None:
+            processed.append(
+                {
+                    "date": datetime.fromtimestamp(props["date"] / 1000),
+                    "value": float(props["value"]),
+                }
+            )
+    processed.sort(key=lambda x: x["date"])
+    return processed 
+    
+def get_image_min_max(asset_id):
+
+    
+    """Min/max of an image asset (cached — one server call per asset)"""
+    img = ee.Image(asset_id)
+    minmax = img.reduce(
+        reducer=ee.Reducer.minMax(),
+        geometry=img.geometry(),
+        scale=1000,
+        maxPixels=1e9,
+    ).getInfo()
+    min_key = next(key for key in minmax if key.endswith("_min"))
+    max_key = next(key for key in minmax if key.endswith("_max"))
+    return minmax[min_key], minmax[max_key]
+
+
+def get_vis_params(parameter, asset_id):
+    # 1. Get the palette
+    palette = PALETTES.get(parameter, PALETTES[""])
+    
+    # 2. FORCE the visual range for 
+    if parameter == "":
+        #  is usually small numbers (0 to 100 mm/month)
+        # Forcing the min to 0 and max to 100 gives a beautiful, visible gradient
+        return {"min": 0, "max": 100, "palette": palette}
+        
+    # 3. For Abstraction (mm & m3), let it calculate dynamically
+    min_val, max_val = get_image_min_max(asset_id)
+    return {"min": min_val, "max": max_val, "palette": palette}
+
+def selection_to_ee_geometry(selection):
+    """Convert a stored drawing (session state) to an Earth Engine Geometry."""
+    if not selection:
+        return None
+
+    geom_type = selection.get("type")
+    coords = selection.get("coordinates")
+    if not geom_type or not coords:
+        return None
+
+    try:
+        if geom_type == "Point":
+            lng, lat = coords[0], coords[1]
+            return ee.Geometry.Point([lng, lat]).buffer(100).bounds()
+
+        if geom_type == "LineString":
+            return ee.Geometry.LineString(coords).buffer(50).bounds()
+
+        if geom_type == "Polygon":
+            return ee.Geometry.Polygon(coords)
+
+        if geom_type == "Rectangle":
+            return ee.Geometry.Polygon(coords)
+
+        if geom_type == "Circle":
+            return ee.Geometry.Polygon(coords)
+
+    except Exception as e:
+        st.warning(f"Could not convert selection to geometry: {e}")
+        return None
+
+    return None
+
+
+def add_colormap(m, vis_params, parameter):
+
+    """Render a custom HTML legend with title on top, units, and clean styling."""
+    unit = UNITS.get(parameter, "")
+    title = f"{t(parameter)}" + (f" ({unit})" if unit else "")
+
+    palette = vis_params["palette"]
+    vmin = vis_params["min"]
+    vmax = vis_params["max"]
+
+    # Build a linear-gradient across the palette for the color bar
+    n = len(palette)
+    stops = ", ".join(
+        f"{color} {int(i * 100 / (n - 1))}%"
+        for i, color in enumerate(palette)
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    # Tick labels: vmin → vmax, evenly spaced
+    num_ticks = 5
+    tick_values = [vmin + (vmax - vmin) * i / (num_ticks - 1) for i in range(num_ticks)]
+    tick_labels = "".join(
+        f'<span style="flex:1; text-align:center;">{v:,.0f}</span>'
+        for v in tick_values
+    )
 
-    return gdp_df
+    legend_html = f"""
+    <div style="
+        position: absolute;
+        bottom: 30px;
+        right: 20px;
+        background: rgba(14, 17, 23, 0.98);
+        border: 2px solid rgba(180, 41, 249, 0.8);
+        border-radius: 10px;
+        padding: 12px 16px;
+        min-width: 260px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+        z-index: 999;
+        font-family: 'Source Sans Pro', 'Segoe UI', Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+    ">
+        <div style="
+            color: #ffffff;
+            font-weight: 700;
+            font-size: 14px;
+            margin-bottom: 10px;
+            text-align: left;
+            letter-spacing: 0.2px;
+        ">{title}</div>
+        <div style="
+            height: 14px;
+            border-radius: 3px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: linear-gradient(to right, {stops});
+            margin-bottom: 6px;
+        "></div>
+        <div style="
+            display: flex;
+            justify-content: space-between;
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1px;
+        ">{tick_labels}</div>
+    </div>
+    """
 
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
+    m.get_root().html.add_child(folium.Element(legend_html))
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+# ==================== Analysis ====================
+def _collection_with_dates(assets, parameter):
+    """ImageCollection of one parameter with time_start parsed from asset names"""
+    parameter_assets = [a for a in assets if parameter in a]
+    images = ee.ImageCollection.fromImages([ee.Image(a) for a in parameter_assets])
 
-st.header(f'GDP in {to_year}', divider='gray')
+    def add_date(img):
+        parts = ee.String(img.get("system:id")).split("_")
+        year = ee.Number.parse(parts.get(-2))
+        month = ee.Number.parse(parts.get(-1))
+        return img.set("system:time_start", ee.Date.fromYMD(year, month, 1).millis())
 
-''
+    return images.map(add_date).sort("system:time_start")
 
-cols = st.columns(4)
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+@st.cache_data(ttl=3600)
+def get_time_series_data(point, parameter, assets):
+    """Monthly values of `parameter` at a clicked point. point = [lat, lon]
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
+    Kept for backwards compatibility with Point selections.
+    """
+    ee_geom = ee.Geometry.Point([point[1], point[0]])
+    return _time_series_for_geometry(ee_geom, parameter, assets, scale=30)
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+    def compute_mean(img):
+        return ee.Feature(
+            None,
+            {
+                "date": img.get("system:time_start"),
+                "value": img.reduce(
+                    reducer=ee.Reducer.mean(),
+                    geometry=ee_geom,
+                    scale=scale,
+                    maxPixels=1e9,
+                ).values().get(0),
+            },
         )
+
+    results = images.map(compute_mean).getInfo()
+
+    processed = []
+    for feature in results["features"]:
+        props = feature["properties"]
+        if props["value"] is not None:
+            processed.append(
+                {
+                    "date": datetime.fromtimestamp(props["date"] / 1000),
+                    "value": float(props["value"]),
+                }
+            )
+    processed.sort(key=lambda x: x["date"])
+    return processed
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_al_summary(parameter, assets, scale):
+    """Mean value of `parameter` over the whole study area, for every month"""
+    images = _collection_with_dates(assets, parameter)
+
+    def _mean(img):
+        mean = img.reduce(
+            reducer=ee.Reducer.mean(),
+            geometry=img.geometry(),
+            scale=max(scale, 100),  # coarse scale keeps this fast
+            maxPixels=1e9,
+        ).values().get(0)
+        return ee.Feature(None, {"date": img.get("system:time_start"), "mean": mean})
+
+    results = images.map(_mean).getInfo()
+    rows = []
+    for feature in results["features"]:
+        props = feature["properties"]
+        if props.get("mean") is not None:
+            rows.append(
+                {
+                    "date": datetime.fromtimestamp(props["date"] / 1000),
+                    "mean": float(props["mean"]),
+                }
+            )
+    rows.sort(key=lambda x: x["date"])
+    return rows
+
+
+def create_empty_time_series_plot(parameter, lat, lon):
+    """Create an empty time series plot with a message to click on the map"""
+    fig = go.Figure()
+
+    # Add a trace with no data to show the chart
+    fig.add_trace(
+        go.Scatter(
+            x=[],
+            y=[],
+            mode="lines+markers",
+            line=dict(color="#B429F9", width=2),
+            marker=dict(size=8, color="#B429F9"),
+        )
+    )
+
+    # Create a message annotation in the center
+    fig.add_annotation(
+        x=0.5,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        text=t("click_to_view"),
+        showarrow=False,
+        font=dict(size=16, color="#888888"),
+        align="center",
+    )
+
+    fig.update_layout(
+        title=t("time_series_title", parameter=t(parameter), lat=f"{lat:.4f}", lon=f"{lon:.4f}"),
+        xaxis=dict(
+            title=t("date"),
+            tickmode="array",
+            tickvals=[],
+            ticktext=[],
+            tickangle=45,
+            showgrid=True,
+        ),
+        yaxis=dict(title=t(parameter), showgrid=True, zeroline=True),
+        template="plotly_white",
+        height=263,
+        margin=dict(t=50, b=80, l=50, r=50),
+    )
+    return fig
+
+
+def create_time_series_plot(time_series_data, parameter, lat, lon, csv_data=None, filename=None):
+    """Create time series plot with optional download button as annotation"""
+    import base64
+
+    df = pd.DataFrame(time_series_data)
+    if df.empty:
+        return create_empty_time_series_plot(parameter, lat, lon)
+
+    df = df.sort_values("date")
+    months = [d.strftime("%Y-%m") for d in df["date"]]
+    x_numeric = list(range(len(months)))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x_numeric,
+            y=df["value"].tolist(),
+            mode="lines+markers",
+            line=dict(color="#B429F9", width=2),
+            marker=dict(size=8, color="#B429F9"),
+            hovertemplate="%{text}: %{y:.2f}<extra></extra>",
+            text=months,
+        )
+    )
+
+    # Create download button as HTML annotation (overlay on chart)
+    if csv_data and filename:
+        b64 = base64.b64encode(csv_data).decode()
+        download_link = f'<a href="data:text/csv;base64,{b64}" download="{filename}" style="background-color:#ffffff;color:#1a0a2e;padding:6px 14px;border-radius:6px;text-decoration:none;font-weight:600;font-size:13px;border:1px solid #ddd;box-shadow:0 2px 8px rgba(0,0,0,0.15);display:inline-block;font-family:sans-serif;">📥 Download as CSV</a>'
+
+        fig.add_annotation(
+            x=0.98,
+            y=0.98,
+            xref="paper",
+            yref="paper",
+            text=download_link,
+            showarrow=False,
+            font=dict(size=13),
+            bgcolor="rgba(0,0,0,0)",
+            borderpad=0,
+            xanchor="right",
+            yanchor="top",
+        )
+
+    fig.update_layout(
+        title=t("time_series_title", parameter=t(parameter), lat=f"{lat:.4f}", lon=f"{lon:.4f}"),
+        xaxis=dict(
+            title=t("date"),
+            tickmode="array",
+            tickvals=x_numeric,
+            ticktext=months,
+            tickangle=45,
+            showgrid=True,
+        ),
+        yaxis=dict(title=t(parameter), showgrid=True, zeroline=True),
+        template="plotly_white",
+        height=263,
+        margin=dict(t=50, b=80, l=50, r=50),
+    )
+    return fig
+
+
+def create_al_summary_plot(summary_data, parameter, csv_data=None, filename=None, button_text="📥 Download as CSV"):
+    """Create al summary bar chart with optional download button as annotation"""
+
+
+    df = pd.DataFrame(summary_data)
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title=t("no_data_location"),
+            xaxis_title=t("date"),
+            yaxis_title=t(parameter),
+            height=263,
+        )
+        return fig
+
+    months_lbl = [d.strftime("%Y-%m") for d in df["date"]]
+
+    fig = go.Figure(
+        go.Bar(x=months_lbl, y=df["mean"], marker_color="#B429F9")
+    )
+
+    # Create download button as HTML annotation (overlay on chart)
+    if csv_data and filename:
+        b64 = base64.b64encode(csv_data).decode()
+        download_link = f'<a href="data:text/csv;base64,{b64}" download="{filename}" style="background-color:#ffffff;color:#1a0a2e;padding:6px 14px;border-radius:6px;text-decoration:none;font-weight:600;font-size:13px;border:1px solid #ddd;box-shadow:0 2px 8px rgba(0,0,0,0.15);display:inline-block;font-family:sans-serif;">{button_text}</a>'
+
+        fig.add_annotation(
+            x=0.98,
+            y=0.93,
+            xref="paper",
+            yref="paper",
+            text=download_link,
+            showarrow=False,
+            font=dict(size=13),
+            bgcolor="rgba(0,0,0,0)",
+            borderpad=0,
+            xanchor="right",
+            yanchor="top",
+        )
+
+    fig.update_layout(
+        title=t("summary_title", parameter=t(parameter)),
+        xaxis=dict(tickangle=45),
+        template="plotly_white",
+        height=263,
+        margin=dict(t=50, b=80, l=50, r=50),
+    )
+    return fig
+
+
+def to_csv_bytes(rows, value_col="value"):
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["date"] = df["date"].dt.strftime("%Y-%m")
+    return df.to_csv(index=False).encode("utf-8")
+
+
+
+# ==================== Main app ====================
+def main():
+    if "lang" not in st.session_state:
+        st.session_state.lang = "en"
+
+    if "selected_parameter" not in st.session_state:
+        st.session_state.selected_parameter = "abstraction_mm"
+
+    if "selected_date_str" not in st.session_state:
+        st.session_state.selected_date_str = None
+
+    if "date_range" not in st.session_state:
+        st.session_state.date_range = None
+
+    if "search_lat" not in st.session_state:
+        st.session_state.search_lat = None
+
+    if "search_lng" not in st.session_state:
+        st.session_state.search_lng = None
+
+    if "search_pending" not in st.session_state:
+        st.session_state.search_pending = False
+        
+    if "show_location_form" not in st.session_state:
+        st.session_state.show_location_form = False
+
+    st.set_page_config(
+        page_title=t("page_title"),
+        page_icon="💧",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+
+
+
+
+
+    # ============================================================
+    # ✅ FIX: Initialize Earth Engine FIRST — before any widget that
+    # calls get_ee_assets(). Previously this was further down inside
+    # main(), which caused:
+    #   "Error in get_ee_assets: Earth Engine client library not initialized"
+    # ============================================================
+    try:
+        if not initialize_ee():
+            st.error(t("ee_init_failed"))
+            st.stop()
+    except Exception as e:
+        st.error(f"{t('ee_init_critical')}: {str(e)}")
+        st.error(traceback.format_exc())
+        st.stop()
+
+    # ---- DARK THEME CSS ----
+    css_content = """
+        <style>
+        /* Hide Streamlit Cloud top bar buttons */
+        .stApp > header button {
+            display: none !important;
+        }
+        header button {
+            display: none !important;
+        }
+        header div:has(button) {
+            display: none !important;
+        }
+        header [data-testid="stHeader"] [data-testid="stToolbar"] {
+            display: none !important;
+        }
+        .st-emotion-cache-1h9usn1 {
+            display: none !important;
+        }
+        .stApp > header {
+            background: transparent !important;
+            box-shadow: none !important;
+            height: 0px !important;
+            min-height: 0px !important;
+            padding: 0px !important;
+        }
+        .stApp {
+            margin-top: 0 !important;
+        }
+
+        /* Dark background for the entire app */
+        .stApp {
+            background-color: #0e1117 !important;
+        }
+
+        /* Remove default padding at the top */
+        .main .block-container {
+            padding-top: 0rem !important;
+            padding-bottom: 1rem !important;
+        }
+
+        /* Dark background for all containers */
+        div[data-testid="stVerticalBlock"] {
+            background-color: #0e1117 !important;
+        }
+
+        /* COSMIC BLOOM BANNER - Static vibrant gradient */
+        .banner {
+            background: linear-gradient(135deg, 
+                #4a1a8a 0%,
+                #7B2FBE 10%,
+                #26C5F3 20%,
+                #FF9A9E 30%,
+                #FF6B9D 40%,
+                #B429F9 50%,
+                #7b2fbe 60%,
+                #4a1a8a 70%,
+                #2d1b69 80%,
+                #1a0533 90%,
+                #0a0a2e 100%
+            );
+            padding: 1rem 3rem 1rem 3rem;
+            margin: 0 !important;
+            color: white;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.4);
+            box-shadow: 0 4px 30px rgba(180, 41, 249, 0.3);
+            position: relative;
+            overflow: hidden;
+            width: 100% !important;
+            border-radius: 0;
+            display: block;
+        }
+
+        /* Simple sparkle overlay - static */
+        .banner::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(circle at 15% 25%, rgba(180, 41, 249, 0.12) 0%, transparent 40%),
+                radial-gradient(circle at 85% 75%, rgba(255, 107, 157, 0.08) 0%, transparent 35%),
+                radial-gradient(circle at 45% 50%, rgba(38, 197, 243, 0.06) 0%, transparent 50%);
+            pointer-events: none;
+        }
+
+        .banner-inner {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start; /* Pushes everything to the left */
+            flex-wrap: wrap;
+            gap: 2rem;
+            position: relative;
+            z-index: 1;
+       /* max-width: 1200px;  <-- Remove or comment out this line */
+       /* margin: 0 auto;     <-- Remove or comment out this line */
+       margin-left: 20px; /* Optional: adds a little padding on the left */
+   }
+
+        /* Title aligned to LEFT */
+        .banner-title {
+            flex: 1;
+            min-width: 200px;
+            text-align: left;
+        }
+
+        .banner-title h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin: 0;
+            padding: 0;
+            color: white;
+            text-shadow: 0 2px 20px rgba(180, 41, 249, 0.5);
+            text-align: left;
+        }
+
+        .banner-title .subtitle {
+            font-size: 0.95rem;
+            color: rgba(255,255,255,0.85);
+            margin: 0.25rem 0 0 0;
+            padding: 0;
+            text-align: left;
+        }
+
+        .banner-title .welcome {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #ffffff;
+            background: rgba(241, 81, 94, 0.85);
+            border: 1px solid rgba(241, 81, 94, 1);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            padding: 0.4rem 0.8rem;
+            border-radius: 8px;
+            margin: 0.6rem 0 0 0;
+            display: inline-block;
+            width: fit-content;
+            max-width: fit-content;
+            text-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 4px 16px rgba(241, 81, 94, 0.5);
+            text-align: left;
+        }
+
+        /* Language selector in banner - right side */
+        .banner-language {
+            flex-shrink: 0;
+            min-width: 130px;
+            background: rgba(255,255,255,0.12);
+            border-radius: 10px;
+            padding: 0.2rem 0.2rem;
+            border: 1px solid rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+        }
+
+        .banner-language .stSelectbox > div > div {
+            background: transparent !important;
+            border: none !important;
+            color: white !important;
+            border-radius: 8px !important;
+            padding: 0.3rem 1rem !important;
+            min-height: 34px !important;
+            height: 34px !important;
+            font-size: 0.9rem !important;
+            box-shadow: none !important;
+        }
+
+        .banner-language .stSelectbox > div > div:hover {
+            background: rgba(255,255,255,0.1) !important;
+        }
+
+        .banner-language .stSelectbox > div > div > div {
+            color: white !important;
+        }
+
+        .banner-language .stSelectbox svg {
+            fill: white !important;
+            color: white !important;
+        }
+
+        .banner-language .stSelectbox > label {
+            display: none !important;
+        }
+
+        /* Dark background for all containers */
+        div[data-testid="stVerticalBlock"] {
+            background-color: #0e1117 !important;
+        }
+
+        /* Light text for headers and labels */
+        h1, h2, h3, h4, h5, h6, label, .stMarkdown, .stText {
+            color: #e0e0e0 !important;
+        }
+
+        /* Set h3 headers to 22px */
+        h3 {
+            font-size: 22px !important;
+        }
+
+        /* Set click message to 16px with metric label color (#26C5F3) */
+        .click-message {
+            font-size: 16px !important;
+            color: #26C5F3 !important;
+            font-weight: 400 !important;
+        }
+
+        /* Parameter buttons - color #a8f368 (GREEN) */
+        .stButton > button:not([kind="primary"]) {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+            border: none !important;
+            border-radius: 8px !important;
+            padding: 0.5rem 1rem !important;
+            font-size: 1rem !important;
+            font-weight: 600 !important;
+            width: 100% !important;
+            transition: all 0.3s ease !important;
+            cursor: pointer !important;
+            text-align: center !important;
+            justify-content: center !important;
+            align-items: center !important;
+            display: flex !important;
+            height: 38px !important;
+            line-height: 1.2 !important;
+        }
+
+        .stButton > button:not([kind="primary"]):hover {
+            background-color: #8fd154 !important;
+            color: #1a0a2e !important;
+            border: none !important;
+            box-shadow: 0 2px 15px rgba(168, 243, 104, 0.4) !important;
+            transform: translateY(-1px) !important;
+        }
+
+        .stButton > button:not([kind="primary"]):active {
+            transform: translateY(0px) !important;
+        }
+
+        .stButton {
+            display: block !important;
+            width: 100% !important;
+        }
+
+        /* Generate Analysis buttons - color #696eff (PURPLE/BLUE) */
+        .stButton > button[kind="primary"] {
+            background-color: #696eff !important;
+            color: white !important;
+            border: none !important;
+            border-radius: 8px !important;
+            padding: 0.5rem 1rem !important;
+            font-size: 1rem !important;
+            font-weight: 600 !important;
+            width: 100% !important;
+            transition: all 0.3s ease !important;
+            cursor: pointer !important;
+            text-align: center !important;
+            justify-content: center !important;
+            align-items: center !important;
+            display: flex !important;
+            height: 38px !important;
+            line-height: 1.2 !important;
+        }
+
+        .stButton > button[kind="primary"]:hover {
+            background-color: #4f54d4 !important;
+            color: white !important;
+            box-shadow: 0 2px 15px rgba(105, 110, 255, 0.5) !important;
+            transform: translateY(-1px) !important;
+        }
+
+        .stButton > button[kind="primary"]:active {
+            transform: translateY(0px) !important;
+        }
+
+        /* Hide Streamlit's default download button (now embedded in chart) */
+        .stDownloadButton {
+            display: none !important;
+        }
+
+        /* Add spacing between sections - using h3 tags inside divs */
+        .stats-section {
+            margin-top: 0 !important;
+        }
+
+        .stats-section h3 {
+            margin-top: 0 !important;
+            padding-top: 4px !important;
+            margin-bottom: 10px !important;
+        }
+
+        .time-series-section h3 {
+            margin-top: 25px !important;
+            margin-bottom: 10px !important;
+        }
+
+        .al-summary-section h3 {
+            margin-top: 25px !important;
+            margin-bottom: 10px !important;
+        }
+
+        /* LANGUAGE SELECTOR - color #a8f368 */
+        .stSelectbox > div > div {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+            border-radius: 8px !important;
+            border: none !important;
+            padding: 0.5rem 1rem !important;
+            min-height: 38px !important;
+            height: 38px !important;
+            display: flex !important;
+            align-items: center !important;
+            font-size: 1rem !important;
+            font-weight: 600 !important;
+        }
+
+        .stSelectbox > div > div:hover {
+            background-color: #8fd154 !important;
+        }
+
+        .stSelectbox > div > div > div {
+            color: #1a0a2e !important;
+        }
+
+        .stSelectbox > div > div > div[data-baseweb="select"] {
+            color: #1a0a2e !important;
+        }
+
+        .stSelectbox > div > div > div[data-baseweb="select"] > div {
+            color: #1a0a2e !important;
+        }
+
+        .stSelectbox > div > div > div[data-baseweb="select"] > div > div {
+            color: #1a0a2e !important;
+        }
+
+        .stSelectbox [data-testid="stMarkdownContainer"] p {
+            color: #1a0a2e !important;
+        }
+
+        .stSelectbox > label {
+            color: #1a0a2e !important;
+        }
+
+        .stSelectbox svg {
+            fill: #1a0a2e !important;
+            color: #1a0a2e !important;
+        }
+
+        /* Dropdown menu items */
+        .stSelectbox > div > div ul {
+            background-color: #1a0a2e !important;
+        }
+
+        .stSelectbox > div > div ul li {
+            color: white !important;
+        }
+
+        .stSelectbox > div > div ul li:hover {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+        }
+
+        /* Dark background for metric cards */
+        div[data-testid="stMetric"] {
+            background: linear-gradient(135deg, #1a0a2e, #2d1b4e) !important;
+            padding: 10px !important;
+            border-radius: 8px !important;
+            border: 1px solid rgba(180, 41, 249, 0.2) !important;
+        }
+
+        div[data-testid="stMetric"] label {
+            color: #26C5F3 !important;
+        }
+
+        div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+            color: #e0e0e0 !important;
+        }
+
+        /* Dark background for info boxes */
+        .stAlert {
+            background: linear-gradient(135deg, #1a0a2e, #2d1b4e) !important;
+            color: #e0e0e0 !important;
+        }
+
+        /* Dark background for expanders */
+        .streamlit-expanderHeader {
+            background: linear-gradient(135deg, #1a0a2e, #2d1b4e) !important;
+            color: #e0e0e0 !important;
+        }
+
+        .streamlit-expanderContent {
+            background: linear-gradient(135deg, #1a0a2e, #2d1b4e) !important;
+            color: #e0e0e0 !important;
+        }
+
+        /* Hide map attribution */
+        .leaflet-control-attribution {
+            display: none !important;
+        }
+
+        .folium-map .leaflet-control-attribution {
+            display: none !important;
+        }
+
+        /* Dark background for dataframes */
+        .stDataFrame {
+            background-color: #1a0a2e !important;
+        }
+
+        /* Dark background for sidebar */
+        .stSidebar {
+            background-color: #0e1117 !important;
+        }
+
+        /* Divider color */
+        hr {
+            border-color: rgba(180, 41, 249, 0.3) !important;
+        }
+
+        /* Caption text */
+        .stCaption {
+            color: #9ca3af !important;
+        }
+        
+        /* ========== DATE RANGE PICKER STYLING ========== */
+        div[data-testid="stDateInput"] > div > div {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+            border-radius: 8px !important;
+            border: none !important;
+        }
+        div[data-testid="stDateInput"] input {
+            color: #1a0a2e !important;
+            font-weight: 600 !important;
+        }
+        div[data-testid="stDateInput"] svg {
+            fill: #1a0a2e !important;
+        }
+        div[data-testid="stDateInput"] label {
+            color: #e0e0e0 !important;
+        }
+
+        /* Calendar popup dark theme */
+        div[data-baseweb="calendar"] {
+            background-color: #1a0a2e !important;
+            border: 1px solid rgba(180, 41, 249, 0.4) !important;
+        }
+        div[data-baseweb="calendar"] button {
+            color: #e0e0e0 !important;
+        }
+        div[data-baseweb="calendar"] button:hover {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+        }
+        div[data-baseweb="calendar"] [aria-selected="true"] {
+            background-color: #B429F9 !important;
+            color: white !important;
+        }
+        /* ========== SCHEME A: GROUPED CONTROLS ========== */
+        /* Date range picker → LIGHT BLUE */
+        div[data-testid="stDateInput"] > div > div {
+            background-color: #cae9ff !important;
+            color: #0e1117 !important;
+            border-radius: 8px !important;
+            border: none !important;
+        }
+        div[data-testid="stDateInput"] input {
+            color: #0e1117 !important;
+            font-weight: 600 !important;
+        }
+        div[data-testid="stDateInput"] svg {
+            fill: #0e1117 !important;
+        }
+
+        /* ===== Selectbox color overrides (aria-label based) ===== */
+
+        /* View month dropdown → LIGHT BLUE (full width) */
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) > div,
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) > div > div,
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) [role="combobox"],
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) [role="combobox"] > div,
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) input,
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) [data-baseweb="select"],
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) [data-baseweb="select"] > div {
+            background-color: #cae9ff !important;
+            color: #0e1117 !important;
+            border-color: #cae9ff !important;
+        }
+        div[data-testid="stSelectbox"]:has(input[aria-label="view_month"]) svg {
+            fill: #0e1117 !important;
+            color: #0e1117 !important;
+        }
+
+        /* Language selector → SOFT PURPLE (full width) */
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) > div,
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) > div > div,
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) [role="combobox"],
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) [role="combobox"] > div,
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) input,
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) [data-baseweb="select"],
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) [data-baseweb="select"] > div {
+            background-color: #B429F9 !important;
+            color: #ffffff !important;
+            border-color: #B429F9 !important;
+        }
+        div[data-testid="stSelectbox"]:has(input[aria-label="🌐"]) svg {
+            fill: #ffffff !important;
+            color: #ffffff !important;
+        }
+        /* ===== Parameter button selected/unselected state ===== */
+
+        /* SELECTED — WHITE with blue border (higher specificity than .stButton rule) */
+        div[class*="st-key-param_mm_active"] .stButton > button:not([kind="primary"]),
+        div[class*="st-key-param_m3_active"] .stButton > button:not([kind="primary"]),
+        div[class*="st-key-param__active"] .stButton > button:not([kind="primary"]) {
+            background-color: #ffffff !important;
+            color: #1a0a2e !important;
+            border: 2px solid #696eff !important;
+            box-shadow: 0 2px 12px rgba(255, 255, 255, 0.3) !important;
+        }
+        div[class*="st-key-param_mm_active"] .stButton > button:not([kind="primary"]):hover,
+        div[class*="st-key-param_m3_active"] .stButton > button:not([kind="primary"]):hover,
+        div[class*="st-key-param__active"] .stButton > button:not([kind="primary"]):hover {
+            background-color: #f0f0f0 !important;
+            color: #1a0a2e !important;
+        }
+
+        /* UNSELECTED — green with dark text */
+        div[class*="st-key-param_mm_inactive"] .stButton > button:not([kind="primary"]),
+        div[class*="st-key-param_m3_inactive"] .stButton > button:not([kind="primary"]),
+        div[class*="st-key-param__inactive"] .stButton > button:not([kind="primary"]) {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+        }
+        div[class*="st-key-param_mm_inactive"] .stButton > button:not([kind="primary"]):hover,
+        div[class*="st-key-param_m3_inactive"] .stButton > button:not([kind="primary"]):hover,
+        div[class*="st-key-param__inactive"] .stButton > button:not([kind="primary"]):hover {
+            background-color: #8fd154 !important;
+            color: #1a0a2e !important;
+        }
+        /* ===== Header border around "🗺️ Interactive Map" ===== */
+        div[data-testid="stMarkdownContainer"]:has(h3:contains("Interactive Map")) {
+            border: 4px solid #e81cff !important;
+            border-radius: 12px !important;
+            padding: 8px 18px !important;
+            display: inline-block !important;
+            background: rgba(232, 28, 255, 0.12) !important;
+            box-shadow: 0 0 20px rgba(232, 28, 255, 0.4) !important;
+        }
+
+        /* ===== Purple border on the map (outer wrapper) ===== */
+        div.stElementContainer:has(> div > iframe[title="streamlit_folium.st_folium"]) > div,
+        div:has(> iframe[title="streamlit_folium.st_folium"]) {
+            border: 4px solid #e81cff !important;
+            border-radius: 12px !important;
+            overflow: hidden !important;
+            box-shadow: 0 0 24px rgba(232, 28, 255, 0.35) !important;
+        }
+        div[data-testid="stIFrame"] {
+            border: 4px solid #e81cff !important;
+            border-radius: 12px !important;
+            overflow: hidden !important;
+            box-shadow: 0 0 24px rgba(232, 28, 255, 0.35) !important;
+        }
+        /* ===== Hide the hidden Specify Location trigger ===== */
+        body div[class*="st-key-hidden_specify_trigger"],
+        body div[class*="st-key-hidden_specify_trigger"] > div,
+        body div[class*="st-key-hidden_specify_trigger"] > div > div,
+        body div.stVerticalBlock[class*="st-key-hidden_specify_trigger"],
+        html body div[class*="st-key-hidden_specify_trigger"],
+        html body div[class*="st-key-hidden_specify_trigger"] > div,
+        html body div[class*="st-key-hidden_specify_trigger"] > div > div > div {
+            display: none !important;
+            height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            visibility: hidden !important;
+        }
+        
+
+        /* ===== Specify Location button — force light blue like date picker ===== */
+        div[class*="st-key-open_specify_location"] button,
+        div[class*="st-key-open_specify_location"] .stButton > button,
+        html body div[class*="st-key-open_specify_location"] button,
+        html body div[class*="st-key-open_specify_location"] .stButton > button,
+        html body button[key="open_specify_location"] {
+            background-color: #cae9ff !important;
+            background: #cae9ff !important;
+            color: #0e1117 !important;
+            border: none !important;
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+            padding: 0 !important;
+            min-height: 38px !important;
+            height: 38px !important;
+            font-size: 14px !important;
+            line-height: 38px !important;
+            box-shadow: none !important;
+            transform: none !important;
+        }
+
+        div[class*="st-key-open_specify_location"] button:hover,
+        html body div[class*="st-key-open_specify_location"] button:hover,
+        html body button[key="open_specify_location"]:hover {
+            background-color: #a8d8f0 !important;
+            background: #a8d8f0 !important;
+            color: #0e1117 !important;
+            box-shadow: 0 2px 15px rgba(168, 216, 240, 0.4) !important;
+            transform: none !important;
+        }
+
+        div[class*="st-key-open_specify_location"] button *,
+        html body div[class*="st-key-open_specify_location"] button * {
+            color: #0e1117 !important;
+            background-color: transparent !important;
+        }
+
+
+         /* ===== Inline Location Form — white card ===== */
+        div[class*="st-key-location_form_wrap"] {
+            background-color: #ffffff !important;
+            border: 2px solid #c6c5c1 !important;
+            border-radius: 12px !important;
+            padding: 20px 24px !important;
+            max-width: 520px !important;
+            margin-top: 12px !important;
+            margin-bottom: 16px !important;
+        }
+        div[class*="st-key-location_form_wrap"] h3,
+        div[class*="st-key-location_form_wrap"] label,
+        div[class*="st-key-location_form_wrap"] p,
+        div[class*="st-key-location_form_wrap"] .stMarkdown,
+        div[class*="st-key-location_form_wrap"] .stCaption {
+            color: #1a0a2e !important;
+        }
+        div[class*="st-key-location_form_wrap"] input[type="number"] {
+            background-color: #ffffff !important;
+            color: #000000 !important;
+            border: 1px solid #c6c5c1 !important;
+        }
+        div[class*="st-key-location_form_wrap"] div[data-baseweb="input"] {
+            background-color: #ffffff !important;
+        }
+        div[class*="st-key-location_form_wrap"] button:not([kind="primary"]) {
+            background-color: #ffffff !important;
+            color: #1a0a2e !important;
+            border: 1px solid #c6c5c1 !important;
+            border-radius: 6px !important;
+        }
+        div[class*="st-key-location_form_wrap"] button:not([kind="primary"]):hover {
+            background-color: #f0f0f0 !important;
+        }
+                div[class*="st-key-location_form_wrap"] button:not([kind="primary"]):hover {
+            background-color: #f0f0f0 !important;
+        }
+
+        /* Pull the metric row up to align with the top of the map */
+        /* Align metric row top with the top of the map */
+        div[class*="st-key-stats_metrics_row"] {
+            margin-top: -50px !important;
+            padding-top: 0 !important;
+        }
+        #div[data-testid="stMetric"] {
+        #    margin-top: -40px !important;
+        #    padding-top: 0 !important;
+        #}
+
+        /* Remove padding on the column container holding the metrics */
+        div[data-testid="column"]:has(div[data-testid="stMetric"]) {
+            padding-top: 0 !important;
+            margin-top: -20px !important;
+        }
+
+        /* Also remove padding on the horizontal block that contains the metric columns */
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) {
+            padding-top: 0 !important;
+            margin-top: -20px !important;
+        }
+        
+        /* 2. Hide the calendar icon inside the input */
+        div[class*="st-key-start_date_wrap"] div[data-testid="stDateInput"] svg,
+        div[class*="st-key-end_date_wrap"] div[data-testid="stDateInput"] svg {
+            display: none !important;
+        }
+        
+        /* 3. Ensure the input doesn't have unnecessary padding now that the icon is gone */
+        div[class*="st-key-start_date_wrap"] div[data-testid="stDateInput"] > div > div,
+        div[class*="st-key-end_date_wrap"] div[data-testid="stDateInput"] > div > div {
+            padding-left: 10px !important;
+            justify-content: center !important;
+        }
+
+        /* 4. Create the fake label INSIDE the input area using CSS */
+        div[class*="st-key-start_date_wrap"] div[data-testid="stDateInput"]::before {
+            content: "START DATE  :  ";
+            color: #0e1117;
+            font-weight: 700;
+            font-size: 14px;
+            margin-right: 5px;
+        }
+
+        div[class*="st-key-end_date_wrap"] div[data-testid="stDateInput"]::before {
+            content: "END DATE  :  ";
+            color: #0e1117;
+            font-weight: 700;
+            font-size: 14px;
+            margin-right: 5px;
+        }
+        /* ===== ULTIMATE FIX FOR POPOVER BUTTONS ===== */
+        
+        /* 1. Force the background to be exactly #a8f368 */
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"] {
+            background-color: #a8f368 !important;
+            background: #a8f368 !important;
+            border: 1px solid #a8f368 !important;
+            border-radius: 8px !important;
+            height: 38px !important;
+            min-height: 38px !important;
+            width: 100% !important;
+            padding: 0 10px !important;
+            box-shadow: none !important;
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+        }
+
+        /* 2. Force all text and icons inside to be black */
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"] *,
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"] span {
+            color: #1a0a2e !important;
+            fill: #1a0a2e !important;
+            font-weight: 600 !important;
+            font-size: 14px !important;
+        }
+
+        /* 3. Hover, Focus, Active states (to prevent the black flash) */
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"]:hover,
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"]:focus,
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"]:active {
+            background-color: #8fd154 !important;
+            background: #8fd154 !important;
+            border-color: #8fd154 !important;
+            box-shadow: none !important;
+            outline: none !important;
+        }
+        /* ===== REGION SELECTBOX (Matches Language Button) ===== */
+        
+        /* 1. The Main Purple Button & Alignment */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div {
+            background-color: #B429F9 !important;
+            border: 1px solid #B429F9 !important;
+            border-radius: 8px !important; 
+            height: 38px !important;
+            min-height: 38px !important;
+            box-shadow: none !important;
+            margin-top: 0px !important; /* Pushes the button down to perfectly align */
+        }
+
+        /* 2. White Text and Transparent Icon Background */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div * {
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            font-size: 14px !important;
+        }
+        
+        /* Fix the white box: Make the background transparent, but keep the arrow white */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div svg {
+            fill: #ffffff !important;
+            background-color: transparent !important;
+        }
+        
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div div {
+            background-color: transparent !important;
+        }
+
+        /* 3. Fix the Green Hover Flash */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div:hover,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div:focus,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div:active {
+            background-color: #9a22d9 !important; 
+            border-color: #9a22d9 !important;
+        }
+
+        /* 4. The Dropdown List (White & Grey Hover) */
+        div[data-baseweb="popover"] ul[role="listbox"] {
+            background-color: #ffffff !important;
+            border-radius: 8px !important;
+            padding: 5px !important;
+        }
+
+        div[data-baseweb="popover"] ul[role="listbox"] li {
+            background-color: #ffffff !important;
+            color: #1a0a2e !important;
+            border-radius: 6px !important;
+            padding: 8px 12px !important;
+            font-weight: 600 !important;
+            margin-bottom: 2px !important;
+        }
+
+        div[data-baseweb="popover"] ul[role="listbox"] li:hover {
+            background-color: #f0f2f6 !important;
+            color: #1a0a2e !important;
+            cursor: pointer !important;
+        }
+        /* ===== ABSTRACTION SELECTBOX (Green) ===== */
+        
+        /* 1. The Main Green Button */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div {
+            background-color: #a8f368 !important;
+            border: 1px solid #a8f368 !important;
+            border-radius: 8px !important; 
+            height: 38px !important;
+            min-height: 38px !important;
+            box-shadow: none !important;
+            margin-top: 0px !important; /* Keep your 0px alignment trick! */
+        }
+
+        /* 2. Dark Text and Transparent Icon Background */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div * {
+            color: #1a0a2e !important;
+            font-weight: 700 !important;
+            font-size: 14px !important;
+        }
+        
+        /* Fix the white box: Make the background transparent, but keep the arrow dark */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div svg {
+            fill: #1a0a2e !important;
+            background-color: transparent !important;
+        }
+        
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div div {
+            background-color: transparent !important;
+        }
+
+        /* 3. Hover State (Slightly darker green to avoid flash) */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div:hover,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div:focus,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Abstraction"]) > div > div:active {
+            background-color: #8fd154 !important; 
+            border-color: #8fd154 !important;
+        }
+        /* ===== RECHARGE SELECTBOX (Green) ===== */
+        
+        /* 1. The Main Green Button */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div {
+            background-color: #a8f368 !important;
+            border: 1px solid #a8f368 !important;
+            border-radius: 8px !important; 
+            height: 38px !important;
+            min-height: 38px !important;
+            box-shadow: none !important;
+            margin-top: 0px !important; 
+        }
+
+        /* 2. Dark Text and Transparent Icon Background */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div * {
+            color: #1a0a2e !important;
+            font-weight: 700 !important;
+            font-size: 14px !important;
+        }
+        
+        /* Fix the white box: Make the background transparent, but keep the arrow dark */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div svg {
+            fill: #1a0a2e !important;
+            background-color: transparent !important;
+        }
+        
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div div {
+            background-color: transparent !important;
+        }
+
+        /* 3. Hover State (Slightly darker green) */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div:hover,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div:focus,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Recharge"]) > div > div:active {
+            background-color: #8fd154 !important; 
+            border-color: #8fd154 !important;
+        }
+        /* ===== ANALYSIS SELECTBOX (Green) ===== */
+        
+        /* 1. The Main Green Button */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div {
+            background-color: #a8f368 !important;
+            border: 1px solid #a8f368 !important;
+            border-radius: 8px !important; 
+            height: 38px !important;
+            min-height: 38px !important;
+            box-shadow: none !important;
+            margin-top: 0px !important; 
+        }
+
+        /* 2. Dark Text and Transparent Icon Background */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div * {
+            color: #1a0a2e !important;
+            font-weight: 700 !important;
+            font-size: 14px !important;
+        }
+        
+        /* Fix the white box: Make the background transparent, but keep the arrow dark */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div svg {
+            fill: #1a0a2e !important;
+            background-color: transparent !important;
+        }
+        
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div div {
+            background-color: transparent !important;
+        }
+
+        /* 3. Hover State (Slightly darker green) */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div:hover,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div:focus,
+        div[data-testid="stSelectbox"]:has(input[aria-label="Analysis"]) > div > div:active {
+            background-color: #8fd154 !important; 
+            border-color: #8fd154 !important;
+        }
+        
+        /* ===== STYLE THE TOP DATE BUTTONS ===== */
+        div[class*="st-key-btn_start_cal_top"] button,
+        div[class*="st-key-btn_end_cal_top"] button {
+            background-color: #cae9ff !important;
+            color: #0e1117 !important;
+            border: none !important;
+            border-radius: 8px !important;
+            height: 38px !important;
+            min-height: 38px !important;
+            width: 100% !important;
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+        }
+        div[class*="st-key-btn_start_cal_top"] button:hover,
+        div[class*="st-key-btn_end_cal_top"] button:hover {
+            background-color: #a8d8f0 !important;
+        }
+
+        /* ===== TOP RIGHT BUTTONS (Reset, Info, Language) ===== */
+        div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-info_btn"]) {
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+            gap: 8px !important;
+        }
+
+        /* Info Button */
+        div[class*="st-key-info_btn"] button {
+            background-color: #a8f368 !important;
+            color: #1a0a2e !important;
+            border-radius: 8px !important;
+            height: 38px !important;
+            min-height: 38px !important;
+            width: 100% !important;
+            padding: 0 !important;
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        div[class*="st-key-info_btn"] button:hover {
+            background-color: #8fd154 !important;
+        }
+        div[class*="st-key-info_btn"] button * {
+            color: #1a0a2e !important;
+            fill: #1a0a2e !important;
+        }
+
+        /* Reset Button */
+        div[class*="st-key-reset_btn"] button {
+            background-color: #B429F9 !important;
+            color: #1a0a2e !important;
+            border-radius: 8px !important;
+            height: 38px !important;
+            min-height: 38px !important;
+            width: 100% !important;
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        div[class*="st-key-reset_btn"] button:hover {
+            background-color: #9a22d9 !important;
+        }
+        div[class*="st-key-reset_btn"] button * {
+            color: #1a0a2e !important;
+            fill: #1a0a2e !important;
+        }
+
+        /* Language Button */
+        div[class*="st-key-lang_wrap"] div[data-testid="stSelectbox"] > div {
+            background-color: transparent !important;
+            border: none !important;
+            border-radius: 8px !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }
+        div[class*="st-key-lang_wrap"] div[data-baseweb="select"] > div {
+            background-color: #B429F9 !important;
+            border: 1px solid #B429F9 !important;
+            border-radius: 8px !important; 
+            height: 38px !important;
+            min-height: 38px !important;
+            box-shadow: none !important;
+        }
+        div[class*="st-key-lang_wrap"] div[data-baseweb="select"] * {
+            color: #ffffff !important;
+            fill: #ffffff !important;
+        }
+        div[class*="st-key-lang_wrap"] > div {
+            border-radius: 8px !important;
+            overflow: hidden !important;
+        }
+
+        /* ===== THE ULTIMATE FONT UNIFY (BOLD) ===== */
+        div[class*="st-key-info_btn"] button p,
+        div[class*="st-key-reset_btn"] button p,
+        div[class*="st-key-loc_dropdown"] button p,
+        div[class*="st-key-abs_dropdown"] button p,
+        div[class*="st-key-rc_dropdown"] button p,
+        div[class*="st-key-analysis_dropdown"] button p,
+        div[class*="st-key-btn_start_cal_top"] button p,
+        div[class*="st-key-btn_end_cal_top"] button p,
+        div[class*="st-key-top_generate"] button p,
+        .stButton > button p {
+            font-weight: 700 !important;
+            font-size: 14px !important;
+        }
+
+        div[class*="st-key-lang_wrap"] div[data-baseweb="select"] div,
+        div[class*="st-key-lang_wrap"] div[data-baseweb="select"] span {
+            font-weight: 700 !important;
+            font-size: 14px !important;
+            
+        /* ===== FORCE LANGUAGE BUTTON TEXT TO BE BOLD ===== */
+        div[class*="st-key-lang_wrap"] input {
+            font-weight: 700 !important;
+            font-size: 14px !important;
+            color: #ffffff !important;
+        }
+        /* ===== THE ULTIMATE LANGUAGE BOLD FIX ===== */
+        div[class*="st-key-lang_wrap"] input {
+            font-family: "Source Sans Pro", "Segoe UI", sans-serif !important; /* Forces font family */
+            font-weight: 700 !important;
+            font-size: 14px !important;
+            color: #ffffff !important;
+        }
+
+        div[class*="st-key-lang_wrap"] div[data-baseweb="select"] div {
+            font-family: "Source Sans Pro", "Segoe UI", sans-serif !important;
+            font-weight: 700 !important;
+        }
+
+        div[class*="st-key-lang_wrap"] span {
+            font-family: "Source Sans Pro", "Segoe UI", sans-serif !important;
+            font-weight: 700 !important;
+        }
+    """
+    
+    # Render the CSS safely
+    st.markdown(css_content, unsafe_allow_html=True)
+
+    # ---- TOP BAR: language + country ----
+    configs = load_country_configs()
+
+    if not configs:
+        st.error(
+            "No country configuration was found.\n\n"
+            "The app expects at least one country JSON file (with a `key` and an "
+            "`asset_path`) inside a **`config/`** folder next to `streamlit_app.py`.\n\n"
+            "On GitHub: open your config file, click the ✏️ edit pencil, and rename it "
+            "to `config/yourcountry.json` (typing `config/` before the name creates the "
+            "folder). Then commit — the app will redeploy automatically."
+        )
+        st.stop()
+
+    country_keys = list(configs.keys())
+    if len(country_keys) == 1:
+        selected_country = country_keys[0]
+    else:
+        try:
+            default_key = st.query_params.get("country", country_keys[0])
+        except AttributeError:
+            default_key = st.experimental_get_query_params().get("country", [country_keys[0]])[0]
+        if default_key not in configs:
+            default_key = country_keys[0]
+        selected_country = st.selectbox(
+            t("country"),
+            options=country_keys,
+            index=country_keys.index(default_key),
+            format_func=lambda k: country_label(configs[k]),
+            label_visibility="collapsed",
+        )
+    cfg = configs[selected_country]
+
+    # ---- RTL support ----
+    dir_attr = "rtl" if st.session_state.lang in ["ar", "ku"] else "ltr"
+
+    # ---- COSMIC BLOOM BANNER - Full Width with Title Left ----
+
+    # Load logos for the banner
+    logo1_b64 = get_base64_image("logo1.png")
+    logo2_b64 = get_base64_image("logo2.png")
+    region_b64 = get_base64_image("region_icon.png")
+    
+    logo1_html = f'<img src="data:image/png;base64,{logo1_b64}" style="height: 150px; margin-right: 20px;" alt="Logo 1">' if logo1_b64 else ""
+    logo2_html = f'<img src="data:image/png;base64,{logo2_b64}" style="height: 150px; margin-left: 20px;" alt="Logo 2">' if logo2_b64 else ""
+
+    banner_html = (
+        '<div class="banner">'
+        '<div class="banner-inner">'
+        '<div style="display: flex; gap: 0px;">'
+        + logo1_html + logo2_html +
+        '</div>'
+        '<div class="banner-title">'
+        '<h1>&#128167; ' + t('dashboard_header') + '</h1>'
+        '<div class="subtitle">' + cfg.get('name_en', '') + ' | ' + datetime.now().strftime('%Y') + '</div>'
+        '<div class="welcome">' + t('welcome_subtitle') + '</div>'
+        '</div>'
+        '</div>'
+        '</div>'
+    )
+
+    st.markdown(banner_html, unsafe_allow_html=True)
+    
+    # Create a flex container for the top-right buttons
+    st.markdown('<div class="top-right-container">', unsafe_allow_html=True)
+    
+    # Use columns for layout, but force them onto one line with CSS
+    c1, c2, c3, c4, c5, c6 = st.columns([3.5, 1, 0.5, 0.5, 0.5, 0.5])
+    
+    # Info Button (c3)
+    with c3:
+        if st.button("ℹ️ Info", key="info_btn", use_container_width=True):
+            st.session_state.show_info_modal = True
+            
+    # Reset Button (c4)
+    with c4:
+        if st.button("🔄 Reset", key="reset_btn", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+    # NEW Download Button (c5)
+    with c5:
+        with st.popover(f"📥 {t('nav_download')}", use_container_width=True, key="download_dropdown"):
+            st.button(t("download_data"), key="dl_data", disabled=True, use_container_width=True)
+            st.button(t("download_report"), key="dl_report", disabled=True, use_container_width=True)
+            
+    # Language Selector (c6)
+    with c6:
+        lang_options = {"English": "en", "العربية": "ar", "کوردی": "ku"}
+        current_label = next(k for k, v in lang_options.items() if v == st.session_state.lang)
+        with st.container(key="lang_wrap"):
+            selected_label = st.selectbox(
+                "🌐",
+                options=list(lang_options.keys()),
+                index=list(lang_options.keys()).index(current_label),
+                key="lang_selector_banner",
+                label_visibility="collapsed",
+            )
+        if lang_options[selected_label] != st.session_state.lang:
+            st.session_state.lang = lang_options[selected_label]
+            st.rerun()
+            
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---- Navigation Buttons (6 columns with date range + view month) ----
+    st.markdown("---")
+    nav_col1, nav_col2, nav_col3, nav_col_month, nav_col_range, nav_col6, nav_col7 = st.columns([1, 1, 1, 1, 1.2, 1.2, 1.1])
+    
+    _abs_active = st.session_state.selected_parameter in ("abstraction_mm", "abstraction_m3")
+    _rc_active = st.session_state.selected_parameter in ("recharge_mm", "recharge_m3")
+
+    # Ensure session state defaults for the new region button
+    if "selected_location" not in st.session_state:
+        st.session_state.selected_location = "subnational"
+
+    # --- Column 1: Region Dropdown ---
+    with nav_col1:
+        if "selected_location" not in st.session_state:
+            st.session_state.selected_location = "subnational"
+
+        # 1. The options list. The first item acts as the button title.
+        raw_options = ["📍 Region", t("nav_subnational"), t("nav_national")]
+        
+        # 2. Find which one is currently selected
+        current_label = t("nav_subnational") if st.session_state.selected_location == "subnational" else t("nav_national")
+        
+        # If nothing is selected yet, default to the title
+        if st.session_state.selected_location not in ["subnational", "national"]:
+            current_index = 0
+        else:
+            current_index = raw_options.index(current_label)
+
+        # 3. CSS to make the button purple and center the text
+        st.markdown("""
+        <style>
+        /* Center the text in the button */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) [data-baseweb="select"] > div {
+            justify-content: center !important;
+        }
+        /* Bold white text */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) [data-baseweb="select"] * {
+            font-weight: 700 !important;
+            color: #ffffff !important;
+            font-size: 14px !important;
+        }
+        /* Force Purple Background */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div {
+            background-color: #B429F9 !important;
+            border: 1px solid #B429F9 !important;
+            border-radius: 8px !important;
+        }
+        /* Hover State */
+        div[data-testid="stSelectbox"]:has(input[aria-label="Region"]) > div > div:hover {
+            background-color: #9a22d9 !important;
+            border-color: #9a22d9 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # 4. The Native Selectbox
+        selected_label = st.selectbox(
+            "Region", 
+            options=raw_options,
+            index=current_index,
+            key="region_selector",
+            label_visibility="collapsed"
+        )
+
+        # 5. Handle the selection and prevent the user from actually selecting "📍 Region"
+        if selected_label == "📍 Region":
+            # If they clicked the title, just rerun to reset it to the current selection
+            st.rerun()
+        else:
+            new_location = "subnational" if selected_label == t("nav_subnational") else "national"
+            if new_location != st.session_state.selected_location:
+                st.session_state.selected_location = new_location
+                st.rerun()
+
+    # --- Column 2: Abstraction Dropdown ---
+    with nav_col2:
+        # Options for the dropdown
+        abs_options = ["abstraction_mm", "abstraction_m3"]
+        abs_labels = [t("nav_abstraction_mm"), t("nav_abstraction_m3")]
+        
+        # Get current state
+        current_abs = st.session_state.selected_parameter
+        if current_abs not in abs_options:
+            current_abs = "abstraction_mm" # Default if something else was selected
+            st.session_state.selected_parameter = current_abs
+            
+        current_abs_idx = abs_options.index(current_abs)
+
+        # Create the selectbox
+        selected_abs_label = st.selectbox(
+            "Abstraction", 
+            options=abs_labels,
+            index=current_abs_idx,
+            key="abs_selector",
+            label_visibility="collapsed"
+        )
+
+        # Update session state if changed
+        new_abs = abs_options[abs_labels.index(selected_abs_label)]
+        if new_abs != current_abs:
+            st.session_state.selected_parameter = new_abs
+            st.session_state.map_generated = False
+            st.rerun()
+
+    # --- Column 3: Recharge Dropdown ---
+    with nav_col3:
+        # Options for the dropdown
+        rc_options = ["recharge_mm", "recharge_m3"]
+        rc_labels = [t("nav_recharge_mm"), t("nav_recharge_m3")]
+        
+        # Get current state
+        current_rc = st.session_state.selected_parameter
+        if current_rc not in rc_options:
+            current_rc = "recharge_mm" # Default if something else was selected
+            st.session_state.selected_parameter = current_rc
+            
+        current_rc_idx = rc_options.index(current_rc)
+
+        # Create the selectbox
+        selected_rc_label = st.selectbox(
+            "Recharge", 
+            options=rc_labels,
+            index=current_rc_idx,
+            key="rc_selector",
+            label_visibility="collapsed"
+        )
+
+        # Update session state if changed
+        new_rc = rc_options[rc_labels.index(selected_rc_label)]
+        if new_rc != current_rc:
+            st.session_state.selected_parameter = new_rc
+            st.session_state.map_generated = False
+            st.rerun()
+
+    # --- Column 4: Analysis Dropdown (Native Selectbox) ---
+    with nav_col_month:
+        # Swapped Irrigation to be before the Climate header
+        ana_options = ["wsi", "water_balance", "irrigation", "climate_header", "aeti", "pet", "precip", "pwl"]
+        
+        ana_labels = [
+            t("nav_wsi"),
+            t("nav_water_balance"),
+            t("nav_irrigation"),
+            f"▼ {t('nav_climate_et')}", # Header
+            f"    {t('nav_aeti')}",
+            f"    {t('nav_pet')}",
+            f"    {t('nav_precip')}",
+            f"    {t('nav_pwl')}"
+        ]
+
+        # Find current index (default to WSI)
+        current_ana = st.session_state.get("selected_analysis", "wsi")
+        if current_ana not in ana_options:
+            current_ana = "wsi"
+            st.session_state.selected_analysis = current_ana
+            
+        current_ana_idx = ana_options.index(current_ana)
+
+        # Create the selectbox
+        selected_ana_label = st.selectbox(
+            "Analysis", 
+            options=ana_labels,
+            index=current_ana_idx,
+            key="analysis_selector",
+            label_visibility="collapsed"
+        )
+
+        # Update session state if changed
+        selected_idx = ana_labels.index(selected_ana_label)
+        new_ana = ana_options[selected_idx]
+        
+        # If they click the header, do nothing. Otherwise, update.
+        if new_ana != "climate_header" and new_ana != current_ana:
+            st.session_state.selected_analysis = new_ana
+            st.session_state.selected_parameter = new_ana
+            st.session_state.map_generated = False
+            st.rerun()
+
+    # --- START DATE & END DATE ---
+    try:
+        asset_path = cfg["asset_path"]
+        assets = get_ee_assets(asset_path)
+        if assets:
+            asset_dates = [d for d in (parse_asset_date(a) for a in assets) if d is not None]
+            if asset_dates:
+                min_date, max_date = min(asset_dates), max(asset_dates)
+
+                # Initialize session state if empty
+                if st.session_state.date_range is None:
+                    st.session_state.date_range = (min_date.date(), max_date.date())
+                    
+    except Exception as e:
+        st.warning(f"Could not load dates: {e}")
+
+    # Column 5: START DATE BUTTON
+    with nav_col_range:
+        if st.button("📅 Start date", key="btn_start_cal_top", use_container_width=True):
+            st.session_state.active_cal = "start"
+            st.rerun()
+
+    # Column 6: END DATE BUTTON
+    with nav_col6:
+        if st.button("📅 End date", key="btn_end_cal_top", use_container_width=True):
+            st.session_state.active_cal = "end"
+            st.rerun()
+
+    # Trigger the Info modal
+    if st.session_state.get("show_info_modal"):
+        show_info_modal()
+
+    # ---- INLINE TARGET DATE FORM (Positioned under Start/End Date) ----
+    if st.session_state.get("active_cal"):
+        active = st.session_state.get("active_cal")
+        
+        # Use the exact same column widths as the main navigation bar
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([1, 1, 1, 1, 1.2, 1.2, 1.1])
+        
+        # Determine which column to render the form in
+        if active == "start":
+            form_col = col5
+        else:
+            form_col = col6
+        
+        with form_col:
+            # Inject CSS directly to make this form white and clean
+            st.markdown("""
+            <style>
+            div[class*="st-key-date_form_wrap"] {
+                background-color: #ffffff !important;
+                border: 2px solid #c6c5c1 !important;
+                border-radius: 12px !important;
+                padding: 15px 20px !important;
+                width: 100% !important;
+                max-width: 260px !important; 
+                margin-top: 1px !important;
+                margin-bottom: 1px !important;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.2) !important;
+            }
+            div[class*="st-key-date_form_wrap"] h3,
+            div[class*="st-key-date_form_wrap"] h4,
+            div[class*="st-key-date_form_wrap"] label,
+            div[class*="st-key-date_form_wrap"] p,
+            div[class*="st-key-date_form_wrap"] .stMarkdown {
+                color: #1a0a2e !important;
+            }
+            
+            /* Make the title smaller and hide the anchor link icon */
+            div[class*="st-key-date_form_wrap"] h3 {
+                font-size: 16px !important; 
+                margin-bottom: 5px !important;
+                margin-top: 0px !important;
+                color: #1a0a2e !important;
+            }
+            div[class*="st-key-date_form_wrap"] h3 a {
+                display: none !important;
+            }
+            
+            div[class*="st-key-date_form_wrap"] div[data-baseweb="select"] > div {
+                background-color: #f0f2f6 !important;
+                border: 1px solid #e0e0e0 !important;
+                border-radius: 8px !important;
+            }
+            div[class*="st-key-date_form_wrap"] div[data-baseweb="select"] * {
+                color: #1a0a2e !important;
+                fill: #1a0a2e !important;
+            }
+            
+            /* Style for the Cancel/Select buttons */
+            div[class*="st-key-date_form_wrap"] button:not([kind="primary"]) {
+                background-color: #ffffff !important;
+                color: #1a0a2e !important;
+                border: 1px solid #c6c5c1 !important;
+                border-radius: 6px !important;
+                font-size: 12px !important;
+                padding: 4px 8px !important;
+                height: 32px !important;
+                min-height: 32px !important;
+            }
+            div[class*="st-key-date_form_wrap"] button:not([kind="primary"]):hover {
+                background-color: #f0f2f6 !important;
+            }
+            div[class*="st-key-date_form_wrap"] button[kind="primary"] {
+                background-color: #a8f368 !important;
+                color: #1a0a2e !important;
+                border: none !important;
+                font-size: 12px !important;
+                padding: 4px 8px !important;
+                height: 32px !important;
+                min-height: 32px !important;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+
+            with st.container(key="date_form_wrap"):
+                # We use ### here, and the CSS above targets the <a> link to hide it
+                st.markdown(f"### {active.upper()} DATE", unsafe_allow_html=True)
+                
+                st.write(f"Current date: **{st.session_state.date_range[0].strftime('%Y / %m / %d') if active == 'start' else st.session_state.date_range[1].strftime('%Y / %m / %d')}**")
+                
+                cal_years = [str(y) for y in range(2018, 2031)]
+                current_year = st.session_state.date_range[0].year if active == 'start' else st.session_state.date_range[1].year
+                sel_year = st.selectbox("Year", cal_years, index=cal_years.index(str(current_year)), key="cal_year_form")
+                
+                cal_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                sel_month = st.selectbox("Month", cal_months, index=0, key="cal_month_form")
+                
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("❌ Cancel", key="cancel_date_form", use_container_width=True):
+                        st.session_state.active_cal = None
+                        st.rerun()
+                with c2:
+                    if st.button("✔ Select", key="submit_date_form", type="primary", use_container_width=True):
+                        new_date = datetime(int(sel_year), cal_months.index(sel_month) + 1, 1).date()
+                        if active == "start":
+                            st.session_state.date_range = (new_date, st.session_state.date_range[1])
+                        else:
+                            st.session_state.date_range = (st.session_state.date_range[0], new_date)
+                        st.session_state.active_cal = None
+                        st.rerun()
+
+    # Get the dates for the map generation
+    start_date = st.session_state.date_range[0]
+    end_date = st.session_state.date_range[1]
+                        
+    # Filter assets based on the chosen dates
+    start_ym = start_date.strftime("%Y_%m")
+    end_ym = end_date.strftime("%Y_%m")
+    assets = [
+        a for a in assets
+        if start_ym <= "_".join(a.split("_")[-2:]) <= end_ym
+    ]
+
+    # Save the available months for the map dropdown
+    ranged_months = sorted({"_".join(a.split("_")[-2:]) for a in assets})
+    st.session_state.ranged_months_disp = [m.replace("_", "-") for m in ranged_months]
+
+    # Generate Analysis button - type="primary" so it gets the purple/blue color
+    with nav_col7:
+        if st.button("🚀 " + t("generate_analysis"), key="top_generate", use_container_width=True, type="primary"):
+            st.session_state.map_generated = True
+            st.session_state.current_parameter = st.session_state.selected_parameter
+            
+            # Set the map to display the START DATE month
+            st.session_state.current_date = st.session_state.date_range[0].strftime("%Y-%m")
+            st.session_state.regional_summary_data = None
+            st.rerun()
+
+    # ===== CUSTOM DATE RANGE TIMELINE =====
+    if st.session_state.get("date_range"):
+        start_dt = st.session_state.date_range[0]
+        end_dt = st.session_state.date_range[1]
+        
+        # Format the dates to look like the screenshot (e.g., "01 JAN 2020")
+        start_str = start_dt.strftime("%d %b %Y").upper()
+        end_str = end_dt.strftime("%d %b %Y").upper()
+        
+    # HTML and CSS for the custom timeline bar
+    timeline_html = (
+        '<div style="display: flex; align-items: center; justify-content: space-between; background: #1e1e1e; border: 1px solid #444; border-radius: 20px; padding: 10px 20px; margin: 0px 0px 20px 780px; max-width: 600px; box-shadow: 0 4px 15px rgba(0,0,0,0.4);">'
+            '<div style="background: #555; color: white; padding: 2px 15px; border-radius: 15px; font-weight: bold; font-size: 12px;">'
+                '<span style="margin-right: 5px;">&#128197;</span> ' + start_str +
+            '</div>'
+            '<div style="flex-grow: 1; height: 4px; background: linear-gradient(90deg, #F1515E, #F1515E); margin: 0 20px; border-radius: 2px; position: relative;">'
+                '<div style="position: absolute; top: -4px; left: 0; width: 12px; height: 12px; background: #F1515E; border-radius: 50%;"></div>'
+                '<div style="position: absolute; top: -4px; right: 0; width: 12px; height: 12px; background: #F1515E; border-radius: 50%;"></div>'
+            '</div>'
+            '<div style="background: #555; color: white; padding: 2px 15px; border-radius: 15px; font-weight: bold; font-size: 12px;">'
+                '<span style="margin-right: 5px;">&#128197;</span> ' + end_str +
+            '</div>'
+        '</div>'
+    )
+    st.markdown(timeline_html, unsafe_allow_html=True)
+    st.markdown("---")
+
+    # ---- Session state ----
+    defaults = {
+        "last_clicked": None,
+        "map_generated": False,
+        "current_parameter": "abstraction_mm",
+        "current_date": None,
+        "time_series_data": None,
+        "current_country": selected_country,
+        "regional_summary_data": None,
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    # Reset map when the country changes
+    if st.session_state.current_country != selected_country:
+        st.session_state.current_country = selected_country
+        st.session_state.map_generated = False
+        st.session_state.last_clicked = None
+        st.session_state.time_series_data = None
+        st.session_state.regional_summary_data = None
+
+    # ---- If no date is selected, set to latest available ----
+    if st.session_state.selected_date_str is None:
+        try:
+            asset_path = cfg["asset_path"]
+            assets = get_ee_assets(asset_path)
+            if assets:
+                asset_dates = [d for d in (parse_asset_date(a) for a in assets) if d is not None]
+                if asset_dates:
+                    latest_date = max(asset_dates)
+                    st.session_state.selected_date_str = latest_date.strftime("%Y-%m")
+        except:
+            pass
+
+    # ---- Main content ----
+    with st.container():
+        if not st.session_state.map_generated:
+            st.markdown(f"### 📊 {t('statistics')}")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric(t('minimum'), "—")
+            with col2:
+                st.metric(t('maximum'), "—")
+            with col3:
+                st.metric(t('mean'), "—")
+        else:
+            try:
+                # 50% / 50% split
+                with st.container(key="map_stats_row"):
+                    map_col, stats_col = st.columns([1, 1])
+
+                # ---- LEFT COLUMN: MAP ----
+                with map_col:
+                    # Map header row: title on left, Specify Location button on right
+                    _h_col1, _h_col2 = st.columns([5, 1.2])
+                    
+                    with _h_col1:
+                        st.markdown(
+                            f"<h3 style='margin:0; padding-top:4px;'>🗺️ {t('interactive_map')}</h3>",
+                            unsafe_allow_html=True,
+                        )
+                            
+                    with _h_col2:
+                        if st.button("📍 Specify Location", key="open_specify_location", use_container_width=True):
+                            st.session_state.show_location_form = not st.session_state.get("show_location_form", False)
+                            st.rerun()
+
+                    # ===== Inline Location Form =====
+                    if st.session_state.get("show_location_form", False):
+                        with st.container(key="location_form_wrap"):
+                            st.markdown("### 📍 Specify Location")
+                            st.caption("Enter coordinates in Decimal Degrees (DD). Example: 36.19120, 44.00940")
+
+                            col_lat, col_lng = st.columns(2)
+                            with col_lat:
+                                lat_val = st.number_input(
+                                    "Latitude",
+                                    min_value=-90.0,
+                                    max_value=90.0,
+                                    value=float(st.session_state.get("search_lat") or 36.19),
+                                    step=0.00001,
+                                    format="%.5f",
+                                    key="inline_lat",
+                                )
+                            with col_lng:
+                                lng_val = st.number_input(
+                                    "Longitude",
+                                    min_value=-180.0,
+                                    max_value=180.0,
+                                    value=float(st.session_state.get("search_lng") or 44.01),
+                                    step=0.00001,
+                                    format="%.5f",
+                                    key="inline_lng",
+                                )
+
+                            col_ok, col_cancel = st.columns([1, 1])
+                            with col_ok:
+                                if st.button("✅ OK", key="inline_ok", type="primary", use_container_width=True):
+                                    st.session_state.search_lat = lat_val
+                                    st.session_state.search_lng = lng_val
+                                    st.session_state.search_pending = True
+                                    st.session_state.show_location_form = False
+                                    st.rerun()
+                            with col_cancel:
+                                if st.button("❌ Cancel", key="inline_cancel", use_container_width=True):
+                                    st.session_state.show_location_form = False
+                                    st.rerun()
+
+                    # ---- Build the map ----
+                    selected_date = datetime.strptime(st.session_state.current_date, "%Y-%m")
+                    selected_year_month = selected_date.strftime("%Y_%m")
+
+                    # Map the parameter name to the actual asset name in Earth Engine
+                    search_param = st.session_state.current_parameter
+
+                    # Look for the correct asset name based on the selected parameter
+                    if search_param == "recharge_mm":
+                        search_param = "recharge"  
+                    elif search_param == "aeti":
+                        search_param = "aeti"  # Make sure this matches your GEE asset name
+                    elif search_param == "pet":
+                        search_param = "pet"
+                    elif search_param == "precip":
+                        search_param = "precip"
+                    elif search_param == "pwl":
+                        search_param = "pwl"
+                    
+                    selected_asset = next(
+                        (
+                            a
+                            for a in assets
+                            if search_param in a and selected_year_month in a
+                        ),
+                        None,
+                    )
+                    
+                    selected_asset = next(
+                        (
+                            a
+                            for a in assets
+                            if search_param in a and selected_year_month in a
+                        ),
+                        None,
+                    )
+                    if not selected_asset:
+                        st.error(t("no_data_month"))
+                        return
+
+                    center_lat = float(cfg["center_lat"])
+                    center_lon = float(cfg["center_lon"])
+                    zoom = int(cfg["zoom"])
+
+                    # If the user searched for a location, override the center
+                    if st.session_state.get("search_pending"):
+                        _search_lat = st.session_state.get("search_lat", center_lat)
+                        _search_lng = st.session_state.get("search_lng", center_lon)
+                        center_lat = float(_search_lat)
+                        center_lon = float(_search_lng)
+                        zoom = 15
+
+                    m = create_base_map(center_lat, center_lon, zoom)
+                    ee_image = ee.Image(selected_asset)
+
+                    opacity = st.session_state.get("opacity", 0.7)
+                    vis_params = get_vis_params(st.session_state.current_parameter, selected_asset)
+                    vis_params["opacity"] = opacity
+
+                    add_ee_layer(
+                        m,
+                        ee_image,
+                        vis_params,
+                        f"{t(st.session_state.current_parameter)} {t('layer')}",
+                    )
+                    add_colormap(m, vis_params, st.session_state.current_parameter)
+
+                    # If the user searched, place a red marker at the location
+                    if st.session_state.get("search_pending"):
+                        folium.Marker(
+                            location=[
+                                st.session_state.get("search_lat"),
+                                st.session_state.get("search_lng"),
+                            ],
+                            popup=f"Searched: {st.session_state.get('search_lat'):.5f}, {st.session_state.get('search_lng'):.5f}",
+                            tooltip="Searched location",
+                            icon=folium.Icon(color="red", icon="map-marker", prefix="fa"),
+                        ).add_to(m)
+                    st.session_state["search_pending"] = False
+                    folium.LayerControl().add_to(m)
+
+                    # Read all drawings from the map
+                    map_data = st_folium(
+                        m,
+                        width=None,
+                        height=850,
+                        returned_objects=["all_drawings"],
+                    )
+
+                    # Process the most recent drawing
+                    drawings = map_data.get("all_drawings") or []
+                    latest = None
+                    for d in reversed(drawings):  # newest first
+                        geom = (d or {}).get("geometry") or {}
+                        if geom.get("type") in ("Point", "LineString", "Polygon"):
+                            latest = d
+                            break
+
+                    if latest:
+                        geom = latest["geometry"]
+                        geom_type = geom["type"]
+                        coords = geom["coordinates"]
+
+                        # Build a stable signature from the full coordinates
+                        import hashlib as _hashlib
+                        _sig_input = f"{geom_type}:{coords}"
+                        signature = _hashlib.md5(_sig_input.encode("utf-8")).hexdigest()
+
+                        if st.session_state.get("_selection_signature") != signature:
+                            st.session_state["_selection_signature"] = signature
+
+                            st.session_state["current_selection"] = {
+                                "type": geom_type,
+                                "coordinates": coords,
+                            }
+
+                            st.session_state.time_series_data = None
+                            st.session_state.regional_summary_data = None
+
+                            sel_geom = selection_to_ee_geometry({
+                                "type": geom_type,
+                                "coordinates": coords,
+                            })
+
+                            if sel_geom is not None:
+                                try:
+                                    _ts = _time_series_for_geometry(
+                                        sel_geom,
+                                        st.session_state.current_parameter,
+                                        tuple(assets),
+                                        scale=100,
+                                    )
+                                    st.session_state.time_series_data = _ts
+                                except Exception as e:
+                                    st.warning(f"Could not compute time series for shape: {e}")
+                                    st.session_state.time_series_data = None
+
+                                if geom_type == "Point":
+                                    lng, lat = coords[0], coords[1]
+                                    st.session_state.last_clicked = {"lat": lat, "lng": lng}
+                                else:
+                                    if geom_type == "LineString":
+                                        first = coords[0]
+                                    elif geom_type == "Polygon":
+                                        first = coords[0][0]
+                                    else:
+                                        first = coords[0]
+                                    st.session_state.last_clicked = {"lat": first[1], "lng": first[0]}
+
+                # ---- RIGHT COLUMN: STATISTICS + Time Series + Regional Summary ----
+                with stats_col:
+                    st.markdown(
+                        f'<div class="stats-section" style="margin-top:-25px;"><h3 style="margin-top:-25px; padding-top:0;">📊 {t("statistics")}</h3></div>',
+                        unsafe_allow_html=True,
+                    )
+                    try:
+                        # Use the drawn shape if there is one; otherwise the whole image
+                        selection_geom = selection_to_ee_geometry(
+                            st.session_state.get("current_selection")
+                        )
+                        geom_to_use = selection_geom if selection_geom else ee_image.geometry()
+
+                        stats = ee_image.reduceRegion(
+                            reducer=ee.Reducer.mean().combine(ee.Reducer.minMax(), None, True),
+                            geometry=geom_to_use,
+                            scale=1000,
+                            maxPixels=1e9,
+                        ).getInfo()
+                        prefix = next(
+                            (k[: -len("_mean")] for k in stats if k.endswith("_mean")), "b1"
+                        )
+
+                        min_val = stats.get(f"{prefix}_min")
+                        max_val = stats.get(f"{prefix}_max")
+                        mean_val = stats.get(f"{prefix}_mean")
+
+                        with st.container(key="stats_metrics_row"):
+                            stat_cols = st.columns(3)
+                        with stat_cols[0]:
+                            st.metric(
+                                t('minimum'),
+                                f"{min_val:.2f}" if isinstance(min_val, (int, float)) else "N/A",
+                            )
+                        with stat_cols[1]:
+                            st.metric(
+                                t('maximum'),
+                                f"{max_val:.2f}" if isinstance(max_val, (int, float)) else "N/A",
+                            )
+                        with stat_cols[2]:
+                            st.metric(
+                                t('mean'),
+                                f"{mean_val:.2f}" if isinstance(mean_val, (int, float)) else "N/A",
+                            )
+                    except Exception as e:
+                        st.error(f"{t('error_statistics')}: {str(e)}")
+
+                    # ---- Regional Monthly Summary (AUTOMATICALLY OPENS) ----
+                    st.markdown(f'<div class="regional-summary-section"><h3>📊 {t("regional_summary")}</h3></div>', unsafe_allow_html=True)
+
+                    # Automatically compute regional summary when map is generated
+                    if st.session_state.regional_summary_data is None:
+                        with st.spinner(t("computing")):
+                            # Filter assets by the selected date range
+                            if st.session_state.date_range:
+                                start_ym = st.session_state.date_range[0].strftime("%Y_%m")
+                                end_ym = st.session_state.date_range[1].strftime("%Y_%m")
+                                ranged_assets = [
+                                    a for a in assets
+                                    if start_ym <= "_".join(a.split("_")[-2:]) <= end_ym
+                                ]
+                            else:
+                                ranged_assets = assets
+
+                            try:
+                                summary = get_regional_summary(
+                                    st.session_state.current_parameter,
+                                    tuple(ranged_assets),
+                                    int(cfg.get("native_scale_m", 20)),
+                                )
+                                if summary:
+                                    st.session_state.regional_summary_data = summary
+                                else:
+                                    st.session_state.regional_summary_data = []
+                            except Exception as e:
+                                st.error(f"Error computing regional summary: {e}")
+                                st.session_state.regional_summary_data = []
+
+                    # Display the chart if we have data
+                    if st.session_state.regional_summary_data:
+                        summary = st.session_state.regional_summary_data
+                        csv_data = to_csv_bytes(summary, value_col="mean")
+                        filename = f"{cfg['key']}_{st.session_state.current_parameter}_regional_summary.csv"
+
+                        fig = create_regional_summary_plot(
+                            summary,
+                            st.session_state.current_parameter,
+                            csv_data=csv_data,
+                            filename=filename,
+                            button_text="📥 Download as CSV",
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        with st.expander(t("raw_data")):
+                            st.dataframe(pd.DataFrame(summary))
+
+                    # ---- Time Series Analysis (ALWAYS OPEN) ----
+                    st.markdown(f'<div class="time-series-section"><h3>📈 {t("time_series_analysis")} <span class="click-message">({t("click_map")})</span></h3></div>', unsafe_allow_html=True)
+
+                    # Get the current center coordinates for the empty chart
+                    center_lat = float(cfg["center_lat"])
+                    center_lon = float(cfg["center_lon"])
+
+                    # Always show the time series chart
+                    if st.session_state.time_series_data:
+                        clicked_lat = st.session_state.last_clicked["lat"]
+                        clicked_lng = st.session_state.last_clicked["lng"]
+
+                        csv_data = to_csv_bytes(st.session_state.time_series_data)
+                        filename = f"{cfg['key']}_{st.session_state.current_parameter}_timeseries_{clicked_lat:.4f}_{clicked_lng:.4f}.csv"
+
+                        fig = create_time_series_plot(
+                            st.session_state.time_series_data,
+                            st.session_state.current_parameter,
+                            clicked_lat,
+                            clicked_lng,
+                            csv_data=csv_data,
+                            filename=filename,
+                        )
+
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        with st.expander(t("raw_data")):
+                            st.dataframe(pd.DataFrame(st.session_state.time_series_data))
+                    else:
+                        # Show empty chart with click message
+                        fig = create_empty_time_series_plot(
+                            st.session_state.current_parameter,
+                            center_lat,
+                            center_lon
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"{t('error_map')}: {str(e)}")
+                st.error(traceback.format_exc())
+
+    # ---- Footer ----
+    with st.expander(t("about_tool")):
+        st.markdown(t("about_text"))
+
+
+if __name__ == "__main__":
+    main()
